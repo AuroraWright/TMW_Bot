@@ -1,6 +1,6 @@
 [![Deploy Discord Bot](https://github.com/friedrich-de/TMW_Bot/actions/workflows/main.yml/badge.svg)](https://github.com/friedrich-de/TMW_Bot/actions/workflows/main.yml)
 
-# TheMoeWay Discord Bot OwO
+# TheMoeWay Discord Bot
 
 Multi-purpose Discord bot developed for the TMW Discord server. The bot is designed to be modular and easy to extend with new features.
 
