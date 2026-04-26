@@ -11,10 +11,13 @@ rank_structure:
       effect: null
       time_limit: 30000
       decks:
-        - "n5"
+        - "jpdb1k"
+      deck_range:
+        - 1
+        - 300
       score_limit: 20
       max_missed: 10
-      command: "k!quiz n5 20 nd mmq=10 dauq=1 font=1 atl=30 color=#f173ff size=100"
+      command: "k!quiz jpdb1k(1-300) 20 nd mmq=10 dauq=1 font=1 atl=30 color=#f173ff size=100"
       no_timeout: true
 
     - name: "Trainee"
