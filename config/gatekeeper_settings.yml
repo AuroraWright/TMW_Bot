@@ -207,12 +207,14 @@ rank_structure:
       effect: "antiocr"
       time_limit: 16000
       decks:
+        - "imm_nandoku"
         - "haado"
-        - "jpdb50k"
+        - "insane"
+        - "j1k"
       deck_range: null
       score_limit: 50
-      max_missed: 9
-      command: "k!quiz haado+jpdb50k 50 nd hardcore dauq=1 font=5 atl=16 mmq=9 color=#f173ff size=100 effect=antiocr"
+      max_missed: 10
+      command: "k!quiz imm_nandoku+haado+insane+j1k nd hardcore 50 dauq=1 font=5 atl=16 mmq=10 color=#f173ff size=100 effect=antiocr"
       no_timeout: false
 
     - name: "TMW Owner"
