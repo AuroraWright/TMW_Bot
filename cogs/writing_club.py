@@ -208,7 +208,7 @@ class WritingClub(commands.Cog):
             except ValueError:
                 return await interaction.response.send_message("Invalid date format. Please use YYYY-MM-DD or YYYY-MM-DD HH:MM.", ephemeral=True)
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
         points_received = round(amount * self.points_per_character, 2)
         total_points_before = await self.get_total_points(interaction.user.id)
@@ -266,23 +266,31 @@ class WritingClub(commands.Cog):
 
         if post_channel is not None:
             try:
-                logged_message = await post_channel.send(embed=log_embed)
+                await post_channel.send(embed=log_embed)
             except discord.HTTPException as e:
                 _log.error("writing_club_log: failed to post to writing_logs_channel_id: %s", e)
-                logged_message = await interaction.followup.send(embed=log_embed)
+                await interaction.followup.send(embed=log_embed, ephemeral=False)
             else:
-                await interaction.followup.send(
-                    f"Your writing log was posted in {post_channel.mention}.",
-                    ephemeral=True,
+                in_writing_logs_channel = interaction.channel and (
+                    interaction.channel.id == post_channel.id
+                    or getattr(interaction.channel, "parent_id", None) == post_channel.id
                 )
+                if in_writing_logs_channel:
+                    try:
+                        await interaction.delete_original_response()
+                    except discord.HTTPException as e:
+                        _log.warning(
+                            "writing_club_log: could not delete deferred response after posting to logs channel: %s",
+                            e,
+                        )
+                        await interaction.followup.send("\u200b", ephemeral=True)
+                else:
+                    await interaction.followup.send(
+                        f"Your writing log was posted in {post_channel.mention}.",
+                        ephemeral=True,
+                    )
         else:
-            logged_message = await interaction.followup.send(embed=log_embed)
-
-        # Reply with URLs if they're in name or comment
-        if name and (name.startswith("http://") or name.startswith("https://")):
-            await logged_message.reply(f"> {name}")
-        elif comment and (comment.startswith("http://") or comment.startswith("https://")):
-            await logged_message.reply(f"> {comment}")
+            await interaction.followup.send(embed=log_embed, ephemeral=False)
 
     async def get_consecutive_days_logged(self, user_id: int) -> int:
         """Calculate consecutive days logged (UTC calendar days)."""
