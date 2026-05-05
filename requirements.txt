@@ -8,5 +8,5 @@ numpy
 seaborn
 pandas
 humanize
-bar_chart_race
+bar_chart_race_fix
 requests
