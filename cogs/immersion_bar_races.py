@@ -128,7 +128,7 @@ class ImmersionBarRaces(commands.Cog):
                 filter_column_colors=True,
                 period_length=500,
                 steps_per_period=20,
-                period_template='%b %#d, %Y')
+                period_fmt='%b %#d, %Y')
 
         with open(temp_file.name, 'rb') as f:
             buffer = io.BytesIO(f.read())
