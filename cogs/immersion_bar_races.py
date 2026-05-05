@@ -1,6 +1,28 @@
 import io
 import asyncio
 import pandas as pd
+
+# bar_chart_race calls DataFrame/Series.fillna(method='ffill'/'bfill'), which
+# pandas >= 2.1 removed. Patch fillna to translate the legacy `method` kwarg
+# into .ffill()/.bfill() so the upstream library keeps working without
+# pinning pandas.
+def _patch_fillna_method():
+    def _make(orig):
+        def _fillna(self, *args, **kwargs):
+            method = kwargs.pop('method', None)
+            if method in ('ffill', 'pad'):
+                return self.ffill()
+            if method in ('bfill', 'backfill'):
+                return self.bfill()
+            return orig(self, *args, **kwargs)
+        return _fillna
+
+    for cls in (pd.DataFrame, pd.Series):
+        cls.fillna = _make(cls.fillna)
+
+
+_patch_fillna_method()
+
 import bar_chart_race as bcr
 import discord
 from discord.ext import commands
