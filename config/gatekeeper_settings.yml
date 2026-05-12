@@ -459,6 +459,7 @@ rank_settings:
       - "jpdb15k"
       - "jpdb20k"
       - "jpdb25k"
+      - "imm_nandoku"
     announce_channel: 617136489482027059
     quiz_menu_message: "To get access to the server, pass the Student quiz!"
   1297383002610995272: # Test_Guild
