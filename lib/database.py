@@ -89,7 +89,9 @@ class EncryptedDatabase:
             )
 
         connection.execute(self._key_pragma)
-        connection.execute("PRAGMA cipher_memory_security = ON")
+        # SQLCipher encryption at rest does not require cipher_memory_security.
+        # Enabling it under Docker's default memlock limit floods stderr with
+        # mlock() warnings during large operations such as backups.
 
     def _connect(self, path: Path | None = None):
         connection = sqlcipher.connect(str(path or self.path), timeout=30)

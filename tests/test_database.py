@@ -69,6 +69,7 @@ class EncryptedDatabaseTests(unittest.TestCase):
         )
         self.assertEqual(database.get_one("PRAGMA user_version"), (17,))
         self.assertEqual(database.get_one("PRAGMA application_id"), (123456,))
+        self.assertEqual(database.get_one("PRAGMA cipher_memory_security"), ("0",))
 
     def test_preflight_migrates_a_copy_without_changing_the_source(self):
         source_path = self.directory / "source.sqlite3"
