@@ -50,10 +50,12 @@ Note: Users need one of the allowed roles (set by admin) to create and keep cust
 
 #### `dumb_db.py`
 
-Simple command that allows users to download a compressed copy of the bot's database file.
+Restricted administrative command that allows configured roles to download a compressed copy of the bot's database file.
 
 Commands:
-* `/post_db` - Creates a gzipped copy of the database file and posts it to the channel. 
+* `/post_db` - Creates a gzipped copy of the database file and sends it privately to the requesting administrator.
+
+Note: Requires `config/dumb_db_settings.yml` to define the role IDs allowed to use the command for each guild. Guilds without an entry cannot use the command.
 
 ---
 

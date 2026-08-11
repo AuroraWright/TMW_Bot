@@ -1,0 +1,5 @@
+# Guild ID: roles allowed to download the bot database with /post_db.
+# Guilds not listed here cannot use the command.
+617136488840429598: # TMW
+  allowed_role_ids:
+    - 1300628357376905216 # Admin

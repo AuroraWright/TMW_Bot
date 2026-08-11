@@ -10,7 +10,10 @@ _log = logging.getLogger(__name__)
 
 class TMWBot(commands.Bot):
     def __init__(self, command_prefix, cog_folder="cogs", path_to_db="data/db.sqlite3"):
-        super().__init__(command_prefix=command_prefix, intents=discord.Intents.all())
+        intents = discord.Intents.default()
+        intents.members = True
+        intents.message_content = True
+        super().__init__(command_prefix=command_prefix, intents=intents)
         self.cog_folder = cog_folder
         self.path_to_db = path_to_db
         self._db_lock = asyncio.Lock()
