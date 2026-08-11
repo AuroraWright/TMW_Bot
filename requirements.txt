@@ -1,6 +1,6 @@
 discord.py
 python-dotenv
-aiosqlite
+sqlcipher3-binary==0.6.0
 aiohttp
 pyyaml
 matplotlib

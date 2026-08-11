@@ -7,7 +7,10 @@ services:
       - DEBUG_USER
       - COMMAND_PREFIX
       - PATH_TO_DB
+      - DATABASE_ENCRYPTION_KEY
       - TMDB_API_KEY
     volumes:
       - ./data:/app/data
+    tmpfs:
+      - /tmp:size=1g,mode=1777
     restart: unless-stopped

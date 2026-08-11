@@ -243,6 +243,11 @@ Note: No user commands - internal utility module only.
 
     `PATH_TO_DB=data/db.sqlite3`
 
+    `DATABASE_ENCRYPTION_KEY=BASE64_ENCODED_32_BYTE_KEY` Generate this once with
+    `openssl rand -base64 32`. Store it as a secret and do not lose it; the
+    database and its backups cannot be recovered without it. You can instead
+    set `DATABASE_ENCRYPTION_KEY_FILE` to the path of a file containing the key.
+
     `TMDB_API_KEY=YOUR_TMDB_API_KEY`
 
 4. Run the bot with `python main.py`, make sure your bot has [Privledged Message Intents](https://discord.com/developers/docs/events/gateway#privileged-intents)
@@ -254,6 +259,44 @@ Note: No user commands - internal utility module only.
 2. Build the docker image with `docker build -t discord-tmw-bot .`
 3. Create a copy of `.env.example` and rename it `.env`, modify the variables to fit your environment
 4. `docker compose up -d`
+
+## Database encryption and backups
+
+The SQLite database is encrypted at rest with SQLCipher. Encryption is mandatory:
+the bot refuses to start without a valid 256-bit key. On the first encrypted
+startup, an existing plaintext SQLite database is verified, migrated in place,
+and verified again before the original path is replaced. New databases are
+encrypted from their first write.
+
+`/post_db` creates a consistent SQLCipher backup and sends the compressed,
+encrypted file privately to an allowed administrator. To decrypt a downloaded
+export locally, install the project requirements, provide the same encryption
+key, and run:
+
+```bash
+DATABASE_ENCRYPTION_KEY='your-base64-key' \
+python -m scripts.database_crypto decrypt db.sqlcipher.sqlite3.gz db.sqlite3
+```
+
+The output is a plaintext database. Protect it appropriately and delete it when
+it is no longer needed. File-based backups created from the encrypted database
+remain encrypted and require the same key for recovery.
+
+Production uses `scripts/backup_database.sh` for consistent, verified encrypted
+daily backups. The deployment workflow encrypts existing backups in place and
+installs this script at `/usr/src/tmw_bot/backup.sh`, the path used by cron.
+
+The production deployment reads the key from a per-deployment, read-only file in
+`/dev/shm`, so the key is not persisted beside the database or its backups. After
+a VPS reboot, manually rerun the deployment workflow to restage the key and
+start the bot.
+
+Production container logs are not persisted because existing diagnostic messages
+can contain Discord API data. Deployment readiness is checked using a marker in
+the container's temporary filesystem instead. While the bot is running, recent
+logs can be inspected with
+`docker exec discord-tmw-bot-container tail -n 200 /tmp/tmw-bot.log`; the log is
+lost when the container is removed or the host restarts.
 
 ## Overwrite Settings
 

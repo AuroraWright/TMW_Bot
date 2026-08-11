@@ -1,5 +1,6 @@
 from lib.bot import TMWBot
 import discord
+import io
 import re
 import aiohttp
 import asyncio
@@ -572,10 +573,11 @@ class LevelUp(commands.Cog):
         else:
             member_string = [str(member) for member in role.members]
             member_string.append(f"\nTotal {member_count} members.")
-            with open("data/rank_user_count.txt", "w", encoding="utf-8") as text_file:
-                text_file.write("\n".join(member_string))
-            await interaction.response.send_message("List of role members too large. Providing role member list in a file:", file=discord.File("data/rank_user_count.txt"))
-            os.remove("data/rank_user_count.txt")
+            member_file = io.BytesIO("\n".join(member_string).encode("utf-8"))
+            await interaction.response.send_message(
+                "List of role members too large. Providing role member list in a file:",
+                file=discord.File(member_file, filename="rank_user_count.txt"),
+            )
 
     async def rank_to_get(self, guild_id: int, rank: dict):
         guild = self.bot.get_guild(guild_id)

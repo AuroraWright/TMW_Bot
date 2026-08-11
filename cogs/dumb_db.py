@@ -10,7 +10,6 @@ from discord.ext import commands
 
 from lib.bot import TMWBot
 
-PATH_TO_DB = os.getenv("PATH_TO_DB", "data/db.sqlite3")
 DUMB_DB_SETTINGS_PATH = (
     os.getenv("ALT_DUMB_DB_SETTINGS_PATH") or "config/dumb_db_settings.yml"
 )
@@ -19,19 +18,32 @@ with open(DUMB_DB_SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
     dumb_db_settings = yaml.safe_load(settings_file) or {}
 
 
-def create_temporary_gzip_file():
+def gzip_database(source_path: str, destination_path: str):
+    with open(source_path, "rb") as f_in, gzip.open(destination_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+
+
+async def create_temporary_gzip_file(bot: TMWBot):
     with tempfile.NamedTemporaryFile(
-        prefix="tmw-db-", suffix=".sqlite3.gz", delete=False
-    ) as temp_file:
-        temp_file_path = temp_file.name
+        prefix="tmw-db-", suffix=".sqlcipher.sqlite3", delete=False
+    ) as database_file:
+        database_path = database_file.name
+    with tempfile.NamedTemporaryFile(
+        prefix="tmw-db-", suffix=".sqlcipher.sqlite3.gz", delete=False
+    ) as archive_file:
+        archive_path = archive_file.name
+
     try:
-        with open(PATH_TO_DB, "rb") as f_in, gzip.open(temp_file_path, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-        return temp_file_path
+        await bot.create_database_backup(database_path)
+        await asyncio.to_thread(gzip_database, database_path, archive_path)
+        return archive_path
     except Exception:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        if os.path.exists(archive_path):
+            os.remove(archive_path)
         raise
+    finally:
+        if os.path.exists(database_path):
+            os.remove(database_path)
 
 
 def has_database_access(interaction: discord.Interaction) -> bool:
@@ -68,9 +80,12 @@ class DatabasePoster(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         temp_file_path = None
         try:
-            temp_file_path = await asyncio.to_thread(create_temporary_gzip_file)
+            temp_file_path = await create_temporary_gzip_file(self.bot)
             await interaction.followup.send(
-                file=discord.File(temp_file_path, filename="db.sqlite3.gz"),
+                file=discord.File(
+                    temp_file_path,
+                    filename="db.sqlcipher.sqlite3.gz",
+                ),
                 ephemeral=True,
             )
         finally:

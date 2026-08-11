@@ -17,29 +17,234 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Stop and remove existing container
+    - name: Stage database encryption key
+      env:
+        DATABASE_ENCRYPTION_KEY: ${{ secrets.DATABASE_ENCRYPTION_KEY }}
       run: |
-        docker stop discord-tmw-bot-container || true
-        docker rm discord-tmw-bot-container || true
+        if docker inspect discord-tmw-bot-container-rollback > /dev/null 2>&1; then
+          echo "A rollback container already exists; resolve it before deploying"
+          exit 1
+        fi
+        if [ -z "$DATABASE_ENCRYPTION_KEY" ]; then
+          echo "DATABASE_ENCRYPTION_KEY is not configured"
+          exit 1
+        fi
+        if ! printf '%s' "$DATABASE_ENCRYPTION_KEY" | base64 --decode > /dev/null; then
+          echo "DATABASE_ENCRYPTION_KEY is not valid base64"
+          exit 1
+        fi
+        if [ "$(printf '%s' "$DATABASE_ENCRYPTION_KEY" | base64 --decode | wc -c)" -ne 32 ]; then
+          echo "DATABASE_ENCRYPTION_KEY must decode to exactly 32 bytes"
+          exit 1
+        fi
+        umask 077
+        printf '%s' "$DATABASE_ENCRYPTION_KEY" \
+          > /dev/shm/tmw-bot-database-encryption-key-${{ github.run_id }}
 
     - name: Build Docker image
       run: |
         docker build -t discord-tmw-bot .
 
+    - name: Test Docker image
+      run: |
+        docker run --rm discord-tmw-bot \
+          python -m unittest discover -s tests -v
+
+    - name: Test production database migration
+      run: |
+        SQLITE_HEADER="53514c69746520666f726d6174203300"
+        CURRENT_HEADER=$(od -An -tx1 -N16 /usr/src/tmw_bot/data/db.sqlite3 | tr -d ' \n')
+        if [ "$CURRENT_HEADER" = "$SQLITE_HEADER" ]; then
+          PREFLIGHT_DIR=$(mktemp -d /dev/shm/tmw-db-preflight.XXXXXX)
+          trap 'rm -rf "$PREFLIGHT_DIR"' EXIT
+          docker run --rm \
+            --mount type=bind,source=/usr/src/tmw_bot/data,target=/source,readonly \
+            --mount type=bind,source="$PREFLIGHT_DIR",target=/preflight \
+            --mount type=bind,source=/dev/shm/tmw-bot-database-encryption-key-${{ github.run_id }},target=/run/secrets/database_encryption_key,readonly \
+            --env DATABASE_ENCRYPTION_KEY_FILE=/run/secrets/database_encryption_key \
+            discord-tmw-bot \
+            python -m scripts.database_crypto preflight-migration \
+            /source/db.sqlite3 /preflight/db.sqlite3
+        else
+          docker run --rm \
+            --mount type=bind,source=/usr/src/tmw_bot/data,target=/source,readonly \
+            --mount type=bind,source=/dev/shm/tmw-bot-database-encryption-key-${{ github.run_id }},target=/run/secrets/database_encryption_key,readonly \
+            --env DATABASE_ENCRYPTION_KEY_FILE=/run/secrets/database_encryption_key \
+            discord-tmw-bot \
+            python -m scripts.database_crypto verify /source/db.sqlite3
+        fi
+
+    - name: Prepare persistent directories
+      run: |
+        docker run --rm \
+          --mount type=bind,source=/usr/src/tmw_bot,target=/host \
+          discord-tmw-bot \
+          mkdir -p /host/data /host/backups
+
+    - name: Stage deployment rollback
+      run: |
+        ROLLBACK_DIR=/dev/shm/tmw-bot-database-rollback-${{ github.run_id }}
+        rm -rf -- "$ROLLBACK_DIR"
+        install -d -m 0700 "$ROLLBACK_DIR"
+        touch "$ROLLBACK_DIR/.staged"
+
+        if docker inspect discord-tmw-bot-container > /dev/null 2>&1; then
+          if [ "$(docker inspect -f '{{.State.Running}}' discord-tmw-bot-container)" = "true" ]; then
+            touch "$ROLLBACK_DIR/.old_was_running"
+            docker stop discord-tmw-bot-container
+          fi
+          if docker rename \
+              discord-tmw-bot-container \
+              discord-tmw-bot-container-rollback; then
+            touch "$ROLLBACK_DIR/.old_renamed"
+          else
+            if [ -f "$ROLLBACK_DIR/.old_was_running" ]; then
+              docker start discord-tmw-bot-container || true
+            fi
+            exit 1
+          fi
+        else
+          touch "$ROLLBACK_DIR/.no_old_container"
+        fi
+
+        SQLITE_HEADER="53514c69746520666f726d6174203300"
+        CURRENT_HEADER=$(od -An -tx1 -N16 /usr/src/tmw_bot/data/db.sqlite3 | tr -d ' \n')
+        if [ "$CURRENT_HEADER" = "$SQLITE_HEADER" ]; then
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount type=bind,source=/usr/src/tmw_bot/data,target=/source,readonly \
+            --mount type=bind,source="$ROLLBACK_DIR",target=/rollback \
+            discord-tmw-bot \
+            python -m scripts.database_crypto snapshot-plaintext \
+            /source/db.sqlite3 /rollback/db.sqlite3
+        fi
+
     - name: Run Docker container
       run: |
         docker run -d \
           --name discord-tmw-bot-container \
+          --log-driver none \
           --mount type=bind,source=/usr/src/tmw_bot/data,target=/app/data \
+          --mount type=bind,source=/usr/src/tmw_bot/backups,target=/app/backups \
+          --mount type=bind,source=/dev/shm/tmw-bot-database-encryption-key-${{ github.run_id }},target=/run/secrets/database_encryption_key,readonly \
+          --tmpfs /tmp:rw,noexec,nosuid,nodev,size=1g \
           --env TOKEN=${{ secrets.TOKEN }} \
           --env COMMAND_PREFIX=${{ vars.COMMAND_PREFIX }} \
           --env PATH_TO_DB=${{ vars.PATH_TO_DB }} \
+          --env DATABASE_ENCRYPTION_KEY_FILE=/run/secrets/database_encryption_key \
+          --env READY_FILE=/tmp/tmw-bot-ready \
+          --env LOG_FILE=/tmp/tmw-bot.log \
           --env AUTHORIZED_USERS=${{ vars.AUTHORIZED_USERS }} \
           --env DEBUG_USER=${{ vars.DEBUG_USER }} \
           --env TMDB_API_KEY=${{ secrets.TMDB_API_KEY }} \
           --env OPENAI_KEY=${{ secrets.OPENAI_KEY }} \
           --restart unless-stopped \
           discord-tmw-bot
+
+    - name: Verify deployment
+      run: |
+        for attempt in $(seq 1 60); do
+          if docker exec discord-tmw-bot-container \
+            test -f /tmp/tmw-bot-ready 2>/dev/null; then
+            exit 0
+          fi
+          if [ "$(docker inspect -f '{{.State.Running}}' discord-tmw-bot-container 2>/dev/null || true)" != "true" ]; then
+            break
+          fi
+          sleep 2
+        done
+        docker inspect \
+          --format 'running={{.State.Running}} exit_code={{.State.ExitCode}} error={{.State.Error}}' \
+          discord-tmw-bot-container 2>/dev/null || true
+        exit 1
+
+    - name: Roll back failed deployment
+      if: failure()
+      run: |
+        ROLLBACK_DIR=/dev/shm/tmw-bot-database-rollback-${{ github.run_id }}
+        KEY_FILE=/dev/shm/tmw-bot-database-encryption-key-${{ github.run_id }}
+        if [ ! -f "$ROLLBACK_DIR/.staged" ]; then
+          echo "Deployment rollback was not staged; production was not changed"
+          rm -f -- "$KEY_FILE"
+          exit 0
+        fi
+
+        if { [ -f "$ROLLBACK_DIR/.old_renamed" ] || [ -f "$ROLLBACK_DIR/.no_old_container" ]; } && \
+            docker inspect discord-tmw-bot-container > /dev/null 2>&1; then
+          docker rm -f discord-tmw-bot-container
+        fi
+
+        if [ -f "$ROLLBACK_DIR/db.sqlite3" ]; then
+          docker run --rm \
+            --mount type=bind,source=/usr/src/tmw_bot/data,target=/data \
+            --mount type=bind,source="$ROLLBACK_DIR",target=/rollback,readonly \
+            discord-tmw-bot \
+            sh -c 'install -m 0600 /rollback/db.sqlite3 /data/db.sqlite3 && rm -f /data/db.sqlite3-journal /data/db.sqlite3-shm /data/db.sqlite3-wal'
+        fi
+
+        if [ -f "$ROLLBACK_DIR/.old_renamed" ] && \
+            docker inspect discord-tmw-bot-container-rollback > /dev/null 2>&1; then
+          OLD_KEY_FILE=$(docker inspect \
+            --format '{{range .Mounts}}{{if eq .Destination "/run/secrets/database_encryption_key"}}{{.Source}}{{end}}{{end}}' \
+            discord-tmw-bot-container-rollback)
+          if [ -n "$OLD_KEY_FILE" ] && [ ! -e "$OLD_KEY_FILE" ]; then
+            install -m 0600 "$KEY_FILE" "$OLD_KEY_FILE"
+          fi
+          docker rename \
+            discord-tmw-bot-container-rollback \
+            discord-tmw-bot-container
+          if [ -f "$ROLLBACK_DIR/.old_was_running" ]; then
+            docker start discord-tmw-bot-container
+          fi
+        elif [ -f "$ROLLBACK_DIR/.old_was_running" ] && \
+            docker inspect discord-tmw-bot-container > /dev/null 2>&1; then
+          docker start discord-tmw-bot-container
+        fi
+
+        rm -rf -- "$ROLLBACK_DIR"
+        rm -f -- "$KEY_FILE"
+
+    - name: Discard deployment rollback
+      run: |
+        docker rm discord-tmw-bot-container-rollback 2>/dev/null || true
+        rm -rf -- /dev/shm/tmw-bot-database-rollback-${{ github.run_id }}
+        find /dev/shm -maxdepth 1 -type f \
+          -name 'tmw-bot-database-encryption-key-*' \
+          ! -name 'tmw-bot-database-encryption-key-${{ github.run_id }}' \
+          -delete
+
+    - name: Install encrypted backup job
+      run: |
+        docker run --rm \
+          --mount type=bind,source=/usr/src/tmw_bot,target=/host \
+          discord-tmw-bot \
+          sh -c 'install -m 0755 /app/scripts/backup_database.sh /host/backup.sh'
+
+    - name: Encrypt and verify existing backups
+      run: |
+        docker exec discord-tmw-bot-container \
+          python -m scripts.database_crypto migrate-backups /app/backups
+
+    - name: Verify encrypted storage
+      run: |
+        docker exec discord-tmw-bot-container \
+          python -m scripts.database_crypto verify /app/data/db.sqlite3
+
+        SQLITE_HEADER="53514c69746520666f726d6174203300"
+        while IFS= read -r DATABASE_FILE; do
+          HEADER=$(od -An -tx1 -N16 "$DATABASE_FILE" | tr -d ' \n')
+          if [ "$HEADER" = "$SQLITE_HEADER" ]; then
+            echo "Plaintext database file remains: $DATABASE_FILE"
+            exit 1
+          fi
+          if [ "$(stat -c '%a' "$DATABASE_FILE")" != "600" ]; then
+            echo "Database permissions are not 600: $DATABASE_FILE"
+            exit 1
+          fi
+        done < <(
+          find /usr/src/tmw_bot/data /usr/src/tmw_bot/backups \
+            -maxdepth 1 -type f -name '*.sqlite3' -print
+        )
 
     - name: Clean up unused Docker images
       run: |

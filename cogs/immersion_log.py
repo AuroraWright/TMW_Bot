@@ -8,7 +8,7 @@ from .immersion_goals import check_goal_status
 from .username_fetcher import get_username_db
 
 import discord
-import os
+import io
 import random
 import csv
 import humanize
@@ -420,27 +420,37 @@ class ImmersionLog(commands.Cog):
         if not user_logs:
             return await interaction.response.send_message("No logs to export for the specified user.", ephemeral=True)
 
-        csv_filename = f"immersion_logs_{user_id}.csv"
-        csv_filepath = os.path.join("/tmp", csv_filename)
+        csv_buffer = io.StringIO(newline="")
+        fieldnames = [
+            "Log ID",
+            "Media Type",
+            "Media Name",
+            "Comment",
+            "Amount Logged",
+            "Points Received",
+            "Log Date",
+        ]
+        writer = csv.DictWriter(csv_buffer, fieldnames=fieldnames)
+        writer.writeheader()
 
-        with open(csv_filepath, mode='w', newline='', encoding='utf-8') as csv_file:
-            fieldnames = ['Log ID', 'Media Type', 'Media Name', 'Comment', 'Amount Logged', 'Points Received', 'Log Date']
-            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-            writer.writeheader()
+        for log in user_logs:
+            writer.writerow(
+                {
+                    "Log ID": log[0],
+                    "Media Type": log[1],
+                    "Media Name": log[2] or "N/A",
+                    "Comment": log[3] or "No comment",
+                    "Amount Logged": log[4],
+                    "Points Received": log[5],
+                    "Log Date": log[6],
+                }
+            )
 
-            for log in user_logs:
-                writer.writerow({
-                    'Log ID': log[0],
-                    'Media Type': log[1],
-                    'Media Name': log[2] or 'N/A',
-                    'Comment': log[3] or 'No comment',
-                    'Amount Logged': log[4],
-                    'Points Received': log[5],
-                    'Log Date': log[6]
-                })
-
-        await interaction.response.send_message("Here are the immersion logs:", file=discord.File(csv_filepath))
-        os.remove(csv_filepath)
+        csv_file = io.BytesIO(csv_buffer.getvalue().encode("utf-8"))
+        await interaction.response.send_message(
+            "Here are the immersion logs:",
+            file=discord.File(csv_file, filename=f"immersion_logs_{user_id}.csv"),
+        )
 
     @discord.app_commands.command(name='logs', description='Output your immersion logs as a text file!')
     @discord.app_commands.describe(user='The user to export logs for (optional)')
@@ -455,23 +465,29 @@ class ImmersionLog(commands.Cog):
         if not user_logs:
             return await interaction.followup.send("No logs to export for the specified user.", ephemeral=True)
 
-        log_filename = f"immersion_logs_{user_id}.txt"
-        log_filepath = os.path.join("/tmp", log_filename)
         # log_id, media_type, media_name, comment, amount_logged, points_received, log_date
-        with open(log_filepath, mode='w', encoding='utf-8') as log_file:
-            for log in user_logs:
-                log_date = datetime.strptime(log[6], '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
-                media_type = log[1]
-                media_name = log[2] or 'N/A'
-                amount_logged = log[4]
-                unit_name = MEDIA_TYPES[media_type]['unit_name'] + 's' if amount_logged > 1 else MEDIA_TYPES[media_type]['unit_name']
-                comment = log[3] or 'No comment'
+        log_entries = []
+        for log in user_logs:
+            log_date = datetime.strptime(log[6], "%Y-%m-%d %H:%M:%S").strftime(
+                "%Y-%m-%d"
+            )
+            media_type = log[1]
+            media_name = log[2] or "N/A"
+            amount_logged = log[4]
+            unit_name = MEDIA_TYPES[media_type]["unit_name"]
+            if amount_logged > 1:
+                unit_name += "s"
+            comment = log[3] or "No comment"
+            log_entries.append(
+                f"{log_date}: {media_type} ({media_name}) -> "
+                f"{amount_logged} {unit_name} | {comment}\n"
+            )
 
-                log_entry = f"{log_date}: {media_type} ({media_name}) -> {amount_logged} {unit_name} | {comment}\n"
-                log_file.write(log_entry)
-
-        await interaction.followup.send("Here are your immersion logs:", file=discord.File(log_filepath))
-        os.remove(log_filepath)
+        log_file = io.BytesIO("".join(log_entries).encode("utf-8"))
+        await interaction.followup.send(
+            "Here are your immersion logs:",
+            file=discord.File(log_file, filename=f"immersion_logs_{user_id}.txt"),
+        )
 
     @discord.app_commands.command(name='log_leaderboard', description='Display the leaderboard for the current month!')
     @discord.app_commands.describe(media_type='Optionally specify the media type for leaderboard filtering.',
