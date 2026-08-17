@@ -331,7 +331,7 @@ class LevelUp(commands.Cog):
 
         rank_has_cooldown = await self.rank_has_cooldown(message.guild.id, performed_quiz_name)
 
-        is_on_cooldown = await self.is_on_cooldown(message, performed_quiz_name, rank_has_cooldown)
+        is_on_cooldown = await self.is_on_cooldown(message, performed_quiz_name, rank_has_cooldown, True)
         if is_on_cooldown:
             await timeout_member(message.author, 2, "Quiz on cooldown.")
             return False
@@ -354,7 +354,7 @@ class LevelUp(commands.Cog):
 
         return True
 
-    async def is_on_cooldown(self, message: discord.Message, quiz_name, rank_has_cooldown):
+    async def is_on_cooldown(self, message: discord.Message, quiz_name, rank_has_cooldown, warn_message):
         if not rank_has_cooldown:
             return False
         last_attempt = await self.bot.GET_ONE(GET_LAST_QUIZ_ATTEMPT, (message.guild.id, message.author.id, quiz_name))
@@ -364,8 +364,9 @@ class LevelUp(commands.Cog):
         last_attempt_time = datetime.fromisoformat(last_attempt_time)
         next_sunday_midnight = get_next_sunday_midnight_from(last_attempt_time)
         if utcnow() < next_sunday_midnight:
-            unix_timestamp = int(next_sunday_midnight.timestamp())
-            await message.channel.send(f"{message.author.mention} You can only attempt this quiz once per week. Your next attempt will be available <t:{unix_timestamp}:R> (on <t:{unix_timestamp}:F>).")
+            if warn_message:
+                unix_timestamp = int(next_sunday_midnight.timestamp())
+                await message.channel.send(f"{message.author.mention} You can only attempt this quiz once per week. Your next attempt will be available <t:{unix_timestamp}:R> (on <t:{unix_timestamp}:F>).")
             return True
         return False
 
@@ -494,6 +495,13 @@ class LevelUp(commands.Cog):
 
         _log.debug(
             f"Processing quiz result for member {member} ({member.id}) - Quiz: {quiz_data['name']}")
+
+        # Kotoba can still complete a quiz after the bot rejects the command
+        # because of the weekly cooldown. Ignore that result entirely, so it
+        # cannot award a role or register a new failed attempt.
+        rank_has_cooldown = await self.rank_has_cooldown(message.guild.id, quiz_data["name"])
+        if await self.is_on_cooldown(message, quiz_data["name"], rank_has_cooldown, False):
+            return
 
         success, quiz_message = await verify_quiz_settings(quiz_data, quiz_result, member)
 
