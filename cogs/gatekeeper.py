@@ -401,9 +401,9 @@ class LevelUp(commands.Cog):
             role_to_get = member.guild.get_role(quiz_data["rank_to_get"])
             await member.remove_roles(*roles)
             await member.add_roles(role_to_get)
-            return role_to_get
+            return False
         else:
-            await self.check_if_combination_rank_earned(member)
+            return await self.check_if_combination_rank_earned(member)
 
     async def check_if_combination_rank_earned(self, member: discord.Member):
         rank_structure = gatekeeper_settings["rank_structure"][member.guild.id]
@@ -414,11 +414,13 @@ class LevelUp(commands.Cog):
         combination_ranks.reverse()
         for rank in combination_ranks:
             if await self.already_owns_higher_or_same_role(rank["rank_to_get"], member):
-                return
+                return True
 
             if all(quiz_name in earned_ranks for quiz_name in rank["quizzes_required"]):
-                role_to_get = await self.reward_user(member, rank)
+                await self.reward_user(member, rank)
+                role_to_get = member.guild.get_role(rank["rank_to_get"])
                 await self.send_in_announcement_channel(member, f"{member.mention} is now a {role_to_get.name}!")
+        return False
 
     async def send_in_announcement_channel(self, member: discord.Member, message: str):
         announcement_channel = member.guild.get_channel(
@@ -515,8 +517,9 @@ class LevelUp(commands.Cog):
                 return
 
         if success:
-            await self.reward_user(member, quiz_data)
-            await self.send_in_announcement_channel(member, quiz_message)
+            blocked_by_existing_role = await self.reward_user(member, quiz_data)
+            if not blocked_by_existing_role:
+                await self.send_in_announcement_channel(member, quiz_message)
             try:
                 await member.send(f"Congratulations! You passed the {quiz_data['name']} quiz!")
             except discord.Forbidden:
