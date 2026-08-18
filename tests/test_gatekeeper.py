@@ -3,7 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import cogs.gatekeeper as gatekeeper
-from cogs.gatekeeper import KOTOBA_BOT_ID, LevelUp
+from cogs.gatekeeper import (
+    ANNOUNCEMENT_ALLOWED,
+    ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE,
+    KOTOBA_BOT_ID,
+    LevelUp,
+)
 
 
 class GatekeeperAnnouncementTests(unittest.IsolatedAsyncioTestCase):
@@ -45,7 +50,7 @@ class GatekeeperAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.level_up, "is_on_cooldown", AsyncMock(return_value=False)),
             patch.object(gatekeeper, "verify_quiz_settings", AsyncMock(return_value=(True, self.quiz_message))),
             patch.object(self.level_up, "already_owns_higher_or_same_role", AsyncMock(return_value=False)),
-            patch.object(self.level_up, "reward_user", AsyncMock(return_value=True)),
+            patch.object(self.level_up, "reward_user", AsyncMock(return_value=ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE)),
             patch.object(self.level_up, "send_in_announcement_channel", AsyncMock()) as send_announcement,
         ):
             await self.level_up.level_up_routine(self.message)
@@ -65,7 +70,7 @@ class GatekeeperAnnouncementTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.level_up, "is_on_cooldown", AsyncMock(return_value=False)),
             patch.object(gatekeeper, "verify_quiz_settings", AsyncMock(return_value=(True, self.quiz_message))),
             patch.object(self.level_up, "already_owns_higher_or_same_role", AsyncMock(return_value=False)),
-            patch.object(self.level_up, "reward_user", AsyncMock(return_value=False)),
+            patch.object(self.level_up, "reward_user", AsyncMock(return_value=ANNOUNCEMENT_ALLOWED)),
             patch.object(self.level_up, "send_in_announcement_channel", AsyncMock()) as send_announcement,
         ):
             await self.level_up.level_up_routine(self.message)
@@ -92,9 +97,35 @@ class GatekeeperAnnouncementTests(unittest.IsolatedAsyncioTestCase):
         ):
             blocked = await self.level_up.check_if_combination_rank_earned(self.member)
 
-        self.assertTrue(blocked)
+        self.assertEqual(blocked, ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE)
         reward_user.assert_not_awaited()
         send_announcement.assert_not_awaited()
+
+    async def test_combination_rank_check_announces_when_rank_is_earned(self):
+        combination_rank = {
+            "name": "Combo Rank",
+            "combination_rank": True,
+            "rank_to_get": 111,
+            "quizzes_required": ["N5", "N4"],
+        }
+        role = SimpleNamespace(name="Combo Role")
+        self.guild.get_role = lambda _: role
+
+        with (
+            patch.object(gatekeeper, "gatekeeper_settings", {"rank_structure": {self.guild.id: [combination_rank]}}),
+            patch.object(self.level_up.bot, "GET", AsyncMock(return_value=[("N5",), ("N4",)])),
+            patch.object(self.level_up, "already_owns_higher_or_same_role", AsyncMock(return_value=False)),
+            patch.object(self.level_up, "reward_user", AsyncMock(return_value=ANNOUNCEMENT_ALLOWED)) as reward_user,
+            patch.object(self.level_up, "send_in_announcement_channel", AsyncMock()) as send_announcement,
+        ):
+            status = await self.level_up.check_if_combination_rank_earned(self.member)
+
+        self.assertEqual(status, ANNOUNCEMENT_ALLOWED)
+        reward_user.assert_awaited_once_with(self.member, combination_rank)
+        send_announcement.assert_awaited_once_with(
+            self.member,
+            f"{self.member.mention} is now a {role.name}!",
+        )
 
 
 if __name__ == "__main__":
