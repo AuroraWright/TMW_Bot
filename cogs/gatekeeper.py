@@ -58,7 +58,6 @@ ADD_PASSED_QUIZ = """INSERT INTO passed_quizzes (guild_id, user_id, quiz_name) V
 
 GET_PASSED_QUIZZES = """SELECT quiz_name FROM passed_quizzes WHERE guild_id = ? AND user_id = ?;"""
 
-
 ADD_USER_THREAD = """INSERT INTO user_threads (user_id, thread_id) VALUES (?, ?)
                      ON CONFLICT(user_id) DO UPDATE SET thread_id = excluded.thread_id;"""
 
@@ -519,8 +518,8 @@ class LevelUp(commands.Cog):
                 return
 
         if success:
-            announcement_status = await self.reward_user(member, quiz_data)
-            if announcement_status:
+            should_announce = await self.reward_user(member, quiz_data)
+            if should_announce:
                 await self.send_in_announcement_channel(member, quiz_message)
             try:
                 await member.send(f"Congratulations! You passed the {quiz_data['name']} quiz!")
