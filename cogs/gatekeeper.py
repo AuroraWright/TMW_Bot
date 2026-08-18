@@ -58,8 +58,6 @@ ADD_PASSED_QUIZ = """INSERT INTO passed_quizzes (guild_id, user_id, quiz_name) V
 
 GET_PASSED_QUIZZES = """SELECT quiz_name FROM passed_quizzes WHERE guild_id = ? AND user_id = ?;"""
 
-ANNOUNCEMENT_ALLOWED = "announcement_allowed"
-ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE = "announcement_blocked_by_existing_role"
 
 ADD_USER_THREAD = """INSERT INTO user_threads (user_id, thread_id) VALUES (?, ?)
                      ON CONFLICT(user_id) DO UPDATE SET thread_id = excluded.thread_id;"""
@@ -404,7 +402,7 @@ class LevelUp(commands.Cog):
             role_to_get = member.guild.get_role(quiz_data["rank_to_get"])
             await member.remove_roles(*roles)
             await member.add_roles(role_to_get)
-            return ANNOUNCEMENT_ALLOWED
+            return True
         else:
             return await self.check_if_combination_rank_earned(member)
 
@@ -417,14 +415,14 @@ class LevelUp(commands.Cog):
         combination_ranks.reverse()
         for rank in combination_ranks:
             if await self.already_owns_higher_or_same_role(rank["rank_to_get"], member):
-                return ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE
+                return False
 
             if all(quiz_name in earned_ranks for quiz_name in rank["quizzes_required"]):
                 await self.reward_user(member, rank)
                 role_to_get = member.guild.get_role(rank["rank_to_get"])
                 await self.send_in_announcement_channel(member, f"{member.mention} is now a {role_to_get.name}!")
-                return ANNOUNCEMENT_ALLOWED
-        return ANNOUNCEMENT_ALLOWED
+                return True
+        return True
 
     async def send_in_announcement_channel(self, member: discord.Member, message: str):
         announcement_channel = member.guild.get_channel(
@@ -522,7 +520,7 @@ class LevelUp(commands.Cog):
 
         if success:
             announcement_status = await self.reward_user(member, quiz_data)
-            if announcement_status != ANNOUNCEMENT_BLOCKED_BY_EXISTING_ROLE:
+            if announcement_status:
                 await self.send_in_announcement_channel(member, quiz_message)
             try:
                 await member.send(f"Congratulations! You passed the {quiz_data['name']} quiz!")
