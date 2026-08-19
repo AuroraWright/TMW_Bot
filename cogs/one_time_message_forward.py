@@ -159,7 +159,7 @@ class MessageForwardSettings:
             raise ValueError(f"message_filter must be one of: {supported}.")
 
         try:
-            send_delay_seconds = float(data.get("send_delay_seconds", 1.25))
+            send_delay_seconds = float(data.get("send_delay_seconds", 30.0))
             retry_delay_seconds = float(data.get("retry_delay_seconds", 300))
             max_attempts = int(data.get("max_attempts", 3))
         except (TypeError, ValueError) as error:

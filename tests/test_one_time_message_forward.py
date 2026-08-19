@@ -19,7 +19,7 @@ def settings(**overrides):
         "message_filter": "link_or_attachment",
         "destination_guild_id": 3,
         "destination_channel_id": 4,
-        "send_delay_seconds": 1.25,
+        "send_delay_seconds": 30.0,
         "retry_delay_seconds": 60,
         "max_attempts": 3,
     }
@@ -49,7 +49,7 @@ class MessageForwardSettingsTests(unittest.TestCase):
 
         self.assertTrue(parsed.enabled)
         self.assertEqual(parsed.message_filter, "link_or_attachment")
-        self.assertEqual(parsed.send_delay_seconds, 1.25)
+        self.assertEqual(parsed.send_delay_seconds, 30.0)
 
     def test_rejects_unknown_message_filter(self):
         with self.assertRaises(ValueError):
@@ -201,10 +201,11 @@ class OneTimeMessageForwardTests(unittest.IsolatedAsyncioTestCase):
         bot = SimpleNamespace(GET=AsyncMock(return_value=[]))
         cog = OneTimeMessageForward(bot, settings())
         cog._record_result = AsyncMock()
+        sleep = AsyncMock()
 
         with patch(
             "cogs.one_time_message_forward.asyncio.sleep",
-            new=AsyncMock(),
+            new=sleep,
         ):
             await cog._forward_messages(
                 source,
@@ -217,6 +218,93 @@ class OneTimeMessageForwardTests(unittest.IsolatedAsyncioTestCase):
         plain_message.forward.assert_not_awaited()
         attached_message.forward.assert_awaited_once_with(destination)
         self.assertEqual(cog._record_result.await_count, 2)
+        self.assertEqual(
+            [awaited.args for awaited in sleep.await_args_list],
+            [(30.0,), (30.0,)],
+        )
+
+    async def test_resume_skips_messages_already_checkpointed_in_database(self):
+        destination = SimpleNamespace()
+        checkpointed_message = SimpleNamespace(
+            id=10,
+            content="https://example.com/already-forwarded",
+            attachments=[],
+            type=discord.MessageType.default,
+            forward=AsyncMock(),
+        )
+        pending_message = SimpleNamespace(
+            id=20,
+            content="",
+            attachments=[SimpleNamespace(filename="pending.zip")],
+            type=discord.MessageType.default,
+            forward=AsyncMock(return_value=SimpleNamespace(id=120)),
+        )
+        source = FakeSourceChannel([[pending_message]])
+        bot = SimpleNamespace(GET=AsyncMock(return_value=[(10, "forwarded")]))
+        cog = OneTimeMessageForward(bot, settings())
+        cog._record_result = AsyncMock()
+        sleep = AsyncMock()
+
+        with patch(
+            "cogs.one_time_message_forward.asyncio.sleep",
+            new=sleep,
+        ):
+            await cog._forward_messages(
+                source,
+                destination,
+                checkpointed_message,
+                pending_message,
+            )
+
+        checkpointed_message.forward.assert_not_awaited()
+        pending_message.forward.assert_awaited_once_with(destination)
+        cog._record_result.assert_awaited_once_with(20, 120, "forwarded")
+        sleep.assert_awaited_once_with(30.0)
+
+    async def test_resume_uses_stored_source_boundaries(self):
+        existing_job = (
+            1,
+            2,
+            10,
+            20,
+            3,
+            4,
+            50,
+            "running",
+            "link_or_attachment",
+        )
+        source = SimpleNamespace()
+        destination = SimpleNamespace()
+        first_message = SimpleNamespace(id=10)
+        last_message = SimpleNamespace(id=20)
+        bot = SimpleNamespace(GET_ONE=AsyncMock(return_value=existing_job))
+        cog = OneTimeMessageForward(bot, settings())
+        cog._preflight = AsyncMock(return_value=(source, destination))
+        cog._discover_source_range = AsyncMock()
+        cog._fetch_source_range = AsyncMock(return_value=(first_message, last_message))
+        cog._initialise_job = AsyncMock(return_value=("running", 50))
+        cog._reconcile_destination = AsyncMock()
+        cog._forward_messages = AsyncMock()
+        cog._complete_job = AsyncMock()
+
+        await cog._run_once()
+
+        cog._discover_source_range.assert_not_awaited()
+        cog._fetch_source_range.assert_awaited_once_with(source, 10, 20)
+        cog._initialise_job.assert_awaited_once_with(destination, 10, 20)
+        cog._reconcile_destination.assert_awaited_once_with(
+            destination,
+            50,
+            10,
+            20,
+        )
+        cog._forward_messages.assert_awaited_once_with(
+            source,
+            destination,
+            first_message,
+            last_message,
+        )
+        cog._complete_job.assert_awaited_once_with()
 
     async def test_destination_reconciliation_recovers_forward_checkpoint(self):
         forwarded_reference = SimpleNamespace(

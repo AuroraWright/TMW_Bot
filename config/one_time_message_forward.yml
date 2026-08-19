@@ -9,8 +9,8 @@ message_filter: "link_or_attachment"
 destination_guild_id: 1539508913102262284
 destination_channel_id: 1539535023911469066
 
-# Discord.py also honors Discord's dynamic rate-limit headers. This additional
-# delay keeps the one-time job deliberately below normal message-send rates.
-send_delay_seconds: 1.25
+# Minimum delay after every successful forward. Discord.py will additionally
+# honor longer dynamic retry_after periods whenever Discord requires them.
+send_delay_seconds: 30.0
 retry_delay_seconds: 300
 max_attempts: 3
