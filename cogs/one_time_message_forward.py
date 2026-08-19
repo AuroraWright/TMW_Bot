@@ -150,7 +150,7 @@ class MessageForwardSettings:
             raise ValueError("first_message_id must not be newer than last_message_id.")
 
         try:
-            send_delay_seconds = float(data.get("send_delay_seconds", 1.25))
+            send_delay_seconds = float(data.get("send_delay_seconds", 31.0))
             retry_delay_seconds = float(data.get("retry_delay_seconds", 300))
             max_attempts = int(data.get("max_attempts", 3))
         except (TypeError, ValueError) as error:

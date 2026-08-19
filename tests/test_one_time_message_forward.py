@@ -20,7 +20,7 @@ def settings(**overrides):
         "last_message_id": 20,
         "destination_guild_id": 3,
         "destination_channel_id": 4,
-        "send_delay_seconds": 1.25,
+        "send_delay_seconds": 31.0,
         "retry_delay_seconds": 60,
         "max_attempts": 3,
     }
@@ -51,7 +51,7 @@ class MessageForwardSettingsTests(unittest.TestCase):
         self.assertTrue(parsed.enabled)
         self.assertEqual(parsed.first_message_id, 10)
         self.assertEqual(parsed.last_message_id, 20)
-        self.assertEqual(parsed.send_delay_seconds, 1.25)
+        self.assertEqual(parsed.send_delay_seconds, 31.0)
 
     def test_rejects_reversed_message_range(self):
         with self.assertRaises(ValueError):
