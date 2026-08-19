@@ -180,6 +180,14 @@ Note: Requires configuration in `selfmute_settings.yml` to define mute roles and
 
 ---
 
+#### `sub_server_access.py`
+
+Restricts configured sub-servers to members who are still in the main server and have the configured Sharing role. Ineligible users are kicked immediately, users banned from the main server are banned from every sub-server, and existing members are checked whenever the bot starts.
+
+No user commands - fully automatic. Server and role IDs are defined in `config/sub_server_settings.yml`. The bot needs the Server Members intent, Ban Members in the main server (to identify existing bans), and Kick Members and Ban Members in each sub-server.
+
+---
+
 #### `sticky_messages.py`
 
 Allows moderators to make messages "sticky" in channels, meaning they will reappear after new messages, making the message always visible at the bottom of the channel.

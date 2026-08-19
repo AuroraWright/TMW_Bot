@@ -1,0 +1,371 @@
+import asyncio
+import logging
+import os
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Any
+
+import discord
+import yaml
+from discord.ext import commands
+
+from lib.bot import TMWBot
+
+_log = logging.getLogger(__name__)
+
+SUB_SERVER_SETTINGS_PATH = Path(
+    os.getenv("ALT_SUB_SERVER_SETTINGS_PATH", "config/sub_server_settings.yml")
+)
+
+
+@dataclass(frozen=True)
+class SubServerSettings:
+    main_guild_id: int
+    required_role_id: int
+    sub_guild_ids: tuple[int, ...]
+
+    @classmethod
+    def from_mapping(cls, data: dict[str, Any]) -> "SubServerSettings":
+        try:
+            main_guild_id = int(data["main_guild_id"])
+            required_role_id = int(data["required_role_id"])
+            configured_sub_guild_ids = data["sub_guild_ids"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "Sub-server settings require integer main_guild_id and "
+                "required_role_id values, plus a sub_guild_ids list."
+            ) from error
+
+        if not isinstance(configured_sub_guild_ids, list):
+            raise TypeError("sub_guild_ids must be a list of Discord guild IDs.")
+
+        try:
+            sub_guild_ids = tuple(
+                dict.fromkeys(int(guild_id) for guild_id in configured_sub_guild_ids)
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("Every sub_guild_ids entry must be an integer.") from error
+
+        if main_guild_id in sub_guild_ids:
+            raise ValueError("The main guild cannot also be a sub-server.")
+
+        return cls(
+            main_guild_id=main_guild_id,
+            required_role_id=required_role_id,
+            sub_guild_ids=sub_guild_ids,
+        )
+
+
+def load_sub_server_settings(path: Path) -> SubServerSettings:
+    with path.open("r", encoding="utf-8") as settings_file:
+        data = yaml.safe_load(settings_file)
+
+    if not isinstance(data, dict):
+        raise TypeError("Sub-server settings must be a YAML mapping.")
+    return SubServerSettings.from_mapping(data)
+
+
+sub_server_settings = load_sub_server_settings(SUB_SERVER_SETTINGS_PATH)
+
+
+class AccessStatus(Enum):
+    ELIGIBLE = "eligible"
+    NOT_IN_MAIN_GUILD = "not_in_main_guild"
+    MISSING_REQUIRED_ROLE = "missing_required_role"
+    BANNED_FROM_MAIN_GUILD = "banned_from_main_guild"
+    CANNOT_VERIFY = "cannot_verify"
+
+
+class SubServerAccess(commands.Cog):
+    def __init__(
+        self,
+        bot: TMWBot,
+        settings: SubServerSettings = sub_server_settings,
+    ):
+        self.bot = bot
+        self.settings = settings
+        self._reconciliation_lock = asyncio.Lock()
+
+    def _get_main_guild(self) -> discord.Guild | None:
+        return self.bot.get_guild(self.settings.main_guild_id)
+
+    def _get_sub_guilds(self) -> list[discord.Guild]:
+        return [
+            guild
+            for guild_id in self.settings.sub_guild_ids
+            if (guild := self.bot.get_guild(guild_id)) is not None
+        ]
+
+    def _is_bot_user(self, user_id: int) -> bool:
+        return self.bot.user is not None and user_id == self.bot.user.id
+
+    @staticmethod
+    def _has_required_role(
+        member: discord.Member,
+        required_role: discord.Role,
+    ) -> bool:
+        return any(role.id == required_role.id for role in member.roles)
+
+    async def _get_access_status(self, user_id: int) -> AccessStatus:
+        main_guild = self._get_main_guild()
+        if main_guild is None:
+            _log.error(
+                "Cannot verify sub-server access because main guild %s is unavailable.",
+                self.settings.main_guild_id,
+            )
+            return AccessStatus.CANNOT_VERIFY
+
+        required_role = main_guild.get_role(self.settings.required_role_id)
+        if required_role is None:
+            _log.error(
+                "Cannot verify sub-server access because role %s is missing from "
+                "main guild %s.",
+                self.settings.required_role_id,
+                self.settings.main_guild_id,
+            )
+            return AccessStatus.CANNOT_VERIFY
+
+        main_member = main_guild.get_member(user_id)
+        if main_member is None:
+            try:
+                main_member = await main_guild.fetch_member(user_id)
+            except discord.NotFound:
+                return await self._status_for_non_member(main_guild, user_id)
+            except (discord.Forbidden, discord.HTTPException) as error:
+                _log.warning(
+                    "Could not verify whether user %s belongs to main guild %s: %s",
+                    user_id,
+                    main_guild.id,
+                    error,
+                )
+                return AccessStatus.CANNOT_VERIFY
+
+        if self._has_required_role(main_member, required_role):
+            return AccessStatus.ELIGIBLE
+        return AccessStatus.MISSING_REQUIRED_ROLE
+
+    async def _status_for_non_member(
+        self,
+        main_guild: discord.Guild,
+        user_id: int,
+    ) -> AccessStatus:
+        try:
+            await main_guild.fetch_ban(discord.Object(id=user_id))
+        except discord.NotFound:
+            return AccessStatus.NOT_IN_MAIN_GUILD
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.warning(
+                "Could not check whether non-member %s is banned from main guild %s: %s",
+                user_id,
+                main_guild.id,
+                error,
+            )
+            return AccessStatus.NOT_IN_MAIN_GUILD
+        return AccessStatus.BANNED_FROM_MAIN_GUILD
+
+    async def _kick_from_sub_guild(
+        self,
+        sub_guild: discord.Guild,
+        user_id: int,
+        reason: str,
+    ) -> None:
+        try:
+            await sub_guild.kick(discord.Object(id=user_id), reason=reason)
+        except discord.NotFound:
+            return
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.error(
+                "Failed to kick user %s from sub-server %s: %s",
+                user_id,
+                sub_guild.id,
+                error,
+            )
+
+    async def _ban_from_sub_guild(
+        self,
+        sub_guild: discord.Guild,
+        user_id: int,
+        reason: str,
+    ) -> None:
+        try:
+            await sub_guild.ban(discord.Object(id=user_id), reason=reason)
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.error(
+                "Failed to ban user %s from sub-server %s: %s",
+                user_id,
+                sub_guild.id,
+                error,
+            )
+
+    async def _enforce_sub_member(self, member: discord.Member) -> None:
+        if self._is_bot_user(member.id):
+            return
+
+        access_status = await self._get_access_status(member.id)
+        if access_status is AccessStatus.ELIGIBLE:
+            return
+        if access_status is AccessStatus.CANNOT_VERIFY:
+            _log.warning(
+                "Leaving user %s in sub-server %s because access could not be verified.",
+                member.id,
+                member.guild.id,
+            )
+            return
+        if access_status is AccessStatus.BANNED_FROM_MAIN_GUILD:
+            await self._ban_from_sub_guild(
+                member.guild,
+                member.id,
+                "User is banned from the main server.",
+            )
+            return
+
+        reasons = {
+            AccessStatus.NOT_IN_MAIN_GUILD: "User is not in the main server.",
+            AccessStatus.MISSING_REQUIRED_ROLE: (
+                "User does not have the required role in the main server."
+            ),
+        }
+        await self._kick_from_sub_guild(
+            member.guild,
+            member.id,
+            reasons[access_status],
+        )
+
+    async def _reconcile_sub_guild(self, sub_guild: discord.Guild) -> None:
+        for member in list(sub_guild.members):
+            await self._enforce_sub_member(member)
+
+    async def _get_banned_user_ids(
+        self,
+        guild: discord.Guild,
+    ) -> set[int] | None:
+        try:
+            return {ban_entry.user.id async for ban_entry in guild.bans(limit=None)}
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.error(
+                "Failed to retrieve bans for server %s: %s",
+                guild.id,
+                error,
+            )
+            return None
+
+    async def synchronize_main_guild_bans(self) -> None:
+        sub_guilds = self._get_sub_guilds()
+        if not sub_guilds:
+            return
+
+        main_guild = self._get_main_guild()
+        if main_guild is None:
+            _log.error(
+                "Cannot synchronize bans because main guild %s is unavailable.",
+                self.settings.main_guild_id,
+            )
+            return
+
+        main_bans = await self._get_banned_user_ids(main_guild)
+        if main_bans is None:
+            return
+
+        for sub_guild in sub_guilds:
+            sub_guild_bans = await self._get_banned_user_ids(sub_guild)
+            if sub_guild_bans is None:
+                continue
+
+            for user_id in main_bans - sub_guild_bans:
+                await self._ban_from_sub_guild(
+                    sub_guild,
+                    user_id,
+                    "User is banned from the main server.",
+                )
+
+    async def reconcile_all_sub_guilds(self) -> None:
+        async with self._reconciliation_lock:
+            configured_guilds = set(self.settings.sub_guild_ids)
+            sub_guilds = self._get_sub_guilds()
+            available_guilds = {guild.id for guild in sub_guilds}
+            for missing_guild_id in configured_guilds - available_guilds:
+                _log.warning(
+                    "Configured sub-server %s is unavailable to the bot.",
+                    missing_guild_id,
+                )
+
+            for sub_guild in sub_guilds:
+                await self._reconcile_sub_guild(sub_guild)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        await self.synchronize_main_guild_bans()
+        await self.reconcile_all_sub_guilds()
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        if guild.id == self.settings.main_guild_id:
+            await self.synchronize_main_guild_bans()
+            await self.reconcile_all_sub_guilds()
+        elif guild.id in self.settings.sub_guild_ids:
+            await self.synchronize_main_guild_bans()
+            await self._reconcile_sub_guild(guild)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        if member.guild.id in self.settings.sub_guild_ids:
+            await self._enforce_sub_member(member)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        if member.guild.id != self.settings.main_guild_id:
+            return
+        if self._is_bot_user(member.id):
+            return
+
+        for sub_guild in self._get_sub_guilds():
+            await self._kick_from_sub_guild(
+                sub_guild,
+                member.id,
+                "User left or was removed from the main server.",
+            )
+
+    @commands.Cog.listener()
+    async def on_member_ban(
+        self,
+        guild: discord.Guild,
+        user: discord.User | discord.Member,
+    ) -> None:
+        if guild.id != self.settings.main_guild_id:
+            return
+        if self._is_bot_user(user.id):
+            return
+
+        for sub_guild in self._get_sub_guilds():
+            await self._ban_from_sub_guild(
+                sub_guild,
+                user.id,
+                "User was banned from the main server.",
+            )
+
+    @commands.Cog.listener()
+    async def on_member_update(
+        self,
+        before: discord.Member,
+        after: discord.Member,
+    ) -> None:
+        if after.guild.id != self.settings.main_guild_id:
+            return
+        if before.roles == after.roles or self._is_bot_user(after.id):
+            return
+
+        required_role = after.guild.get_role(self.settings.required_role_id)
+        if required_role is None or self._has_required_role(after, required_role):
+            return
+
+        for sub_guild in self._get_sub_guilds():
+            await self._kick_from_sub_guild(
+                sub_guild,
+                after.id,
+                "User lost the required role in the main server.",
+            )
+
+
+async def setup(bot: TMWBot) -> None:
+    await bot.add_cog(SubServerAccess(bot))

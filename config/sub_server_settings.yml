@@ -1,0 +1,9 @@
+# Members of a sub-server must also be members of this server.
+main_guild_id: 617136488840429598
+
+# Sharing in the main server. Members must have this exact role.
+required_role_id: 1301694741083328565
+
+# Add one or more sub-server IDs here.
+sub_guild_ids:
+  - 1539508913102262284
