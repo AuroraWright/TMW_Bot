@@ -511,6 +511,10 @@ class LevelUp(commands.Cog):
         if await self.already_owns_higher_or_same_role(quiz_data["rank_to_get"], member):
             return
 
+        earned_ranks = await self.bot.GET(GET_PASSED_QUIZZES, (member.guild.id, member.id))
+        if earned_ranks and quiz_data["name"] in [rank[0] for rank in earned_ranks]:
+            return
+
         if success and quiz_data["require_role"]:
             role_to_have = message.guild.get_role(quiz_data["require_role"])
             if role_to_have not in member.roles:
