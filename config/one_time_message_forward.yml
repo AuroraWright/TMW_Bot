@@ -12,7 +12,6 @@ destination_channel_id: 1539512407053967401
 
 # Discord.py also honors Discord's dynamic rate-limit headers. This additional
 # delay keeps the one-time job deliberately below normal message-send rates.
-# Discord applies a stricter, approximately 30-second limit to native forwards.
-send_delay_seconds: 31.0
+send_delay_seconds: 1.25
 retry_delay_seconds: 300
 max_attempts: 3
