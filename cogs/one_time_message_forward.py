@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path
@@ -188,25 +188,70 @@ class MessageForwardSettings:
         )
 
 
-def load_message_forward_settings(path: Path) -> MessageForwardSettings:
+def parse_message_forward_jobs(
+    data: dict[str, Any],
+) -> tuple[MessageForwardSettings, ...]:
+    configured_jobs = data.get("jobs")
+    if configured_jobs is None:
+        return (MessageForwardSettings.from_mapping(data),)
+    if not isinstance(configured_jobs, list) or not configured_jobs:
+        raise TypeError("jobs must be a non-empty list.")
+
+    shared_keys = (
+        "enabled",
+        "message_filter",
+        "send_delay_seconds",
+        "retry_delay_seconds",
+        "max_attempts",
+    )
+    shared_settings = {key: data[key] for key in shared_keys if key in data}
+    jobs = []
+    job_ids = set()
+    for index, configured_job in enumerate(configured_jobs):
+        if not isinstance(configured_job, dict):
+            raise TypeError(f"jobs[{index}] must be a mapping.")
+        try:
+            job = MessageForwardSettings.from_mapping(
+                {**shared_settings, **configured_job}
+            )
+        except (TypeError, ValueError) as error:
+            raise type(error)(f"jobs[{index}]: {error}") from error
+        if job.job_id in job_ids:
+            raise ValueError(f"jobs[{index}]: duplicate job_id {job.job_id!r}.")
+        job_ids.add(job.job_id)
+        jobs.append(job)
+    return tuple(jobs)
+
+
+def load_message_forward_settings(path: Path) -> tuple[MessageForwardSettings, ...]:
     with path.open("r", encoding="utf-8") as settings_file:
         data = yaml.safe_load(settings_file)
     if not isinstance(data, dict):
         raise TypeError("One-time message-forward settings must be a YAML mapping.")
-    return MessageForwardSettings.from_mapping(data)
+    return parse_message_forward_jobs(data)
 
 
-message_forward_settings = load_message_forward_settings(MESSAGE_FORWARD_SETTINGS_PATH)
+message_forward_jobs = load_message_forward_settings(MESSAGE_FORWARD_SETTINGS_PATH)
 
 
 class OneTimeMessageForward(commands.Cog):
     def __init__(
         self,
         bot: TMWBot,
-        settings: MessageForwardSettings = message_forward_settings,
+        settings: MessageForwardSettings | Sequence[MessageForwardSettings] = (
+            message_forward_jobs
+        ),
     ):
         self.bot = bot
-        self.settings = settings
+        if isinstance(settings, MessageForwardSettings):
+            self.jobs = (settings,)
+        else:
+            self.jobs = tuple(settings)
+        if not self.jobs or not all(
+            isinstance(job, MessageForwardSettings) for job in self.jobs
+        ):
+            raise TypeError("At least one valid message-forward job is required.")
+        self.settings = self.jobs[0]
         self._forward_task: asyncio.Task | None = None
 
     async def cog_load(self) -> None:
@@ -222,26 +267,50 @@ class OneTimeMessageForward(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
-        if not self.settings.enabled:
+        if not any(job.enabled for job in self.jobs):
             return
         if self._forward_task is None or self._forward_task.done():
             self._forward_task = asyncio.create_task(
-                self._run_with_retries(),
-                name=f"message-forward-{self.settings.job_id}",
+                self._run_queue(),
+                name="message-forward-queue",
             )
 
-    async def _run_with_retries(self) -> None:
+    async def _run_queue(self) -> None:
+        enabled_jobs = tuple(job for job in self.jobs if job.enabled)
+        for position, job in enumerate(enabled_jobs, start=1):
+            self.settings = job
+            _log.info(
+                "Message-forward queue starting item %s/%s: %s.",
+                position,
+                len(enabled_jobs),
+                job.job_id,
+            )
+            if not await self._run_with_retries():
+                _log.error(
+                    "Message-forward queue halted at item %s/%s: %s. Later jobs will not start.",
+                    position,
+                    len(enabled_jobs),
+                    job.job_id,
+                )
+                return
+
+        _log.info(
+            "Message-forward queue finished all %s enabled jobs.",
+            len(enabled_jobs),
+        )
+
+    async def _run_with_retries(self) -> bool:
         for attempt in range(1, self.settings.max_attempts + 1):
             try:
                 await self._run_once()
-                return
+                return True
             except asyncio.CancelledError:
                 raise
             except ForwardJobConfigurationError as error:
                 _log.error(
                     "Message-forward job %s stopped: %s", self.settings.job_id, error
                 )
-                return
+                return False
             except Exception as error:  # noqa: BLE001 - task boundary must log failures
                 await self._mark_failed(str(error))
                 _log.exception(
@@ -251,8 +320,10 @@ class OneTimeMessageForward(commands.Cog):
                     self.settings.max_attempts,
                 )
                 if attempt == self.settings.max_attempts:
-                    return
+                    return False
                 await asyncio.sleep(self.settings.retry_delay_seconds)
+
+        return False
 
     async def _mark_failed(self, error: str) -> None:
         await self.bot.RUN(

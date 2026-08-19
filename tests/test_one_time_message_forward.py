@@ -7,6 +7,7 @@ import discord
 from cogs.one_time_message_forward import (
     MessageForwardSettings,
     OneTimeMessageForward,
+    parse_message_forward_jobs,
 )
 
 
@@ -59,8 +60,94 @@ class MessageForwardSettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             settings(send_delay_seconds=0.5)
 
+    def test_queue_parser_preserves_order_and_applies_shared_settings(self):
+        jobs = parse_message_forward_jobs(
+            {
+                "enabled": True,
+                "message_filter": "link_or_attachment",
+                "send_delay_seconds": 30,
+                "retry_delay_seconds": 300,
+                "max_attempts": 3,
+                "jobs": [
+                    {
+                        "job_id": "first",
+                        "source_guild_id": 1,
+                        "source_channel_id": 2,
+                        "destination_guild_id": 3,
+                        "destination_channel_id": 4,
+                    },
+                    {
+                        "job_id": "second",
+                        "source_guild_id": 1,
+                        "source_channel_id": 5,
+                        "destination_guild_id": 3,
+                        "destination_channel_id": 6,
+                    },
+                ],
+            }
+        )
+
+        self.assertEqual([job.job_id for job in jobs], ["first", "second"])
+        self.assertTrue(all(job.enabled for job in jobs))
+        self.assertTrue(all(job.send_delay_seconds == 30 for job in jobs))
+
+    def test_queue_parser_rejects_duplicate_job_ids(self):
+        shared_job = {
+            "job_id": "duplicate",
+            "source_guild_id": 1,
+            "source_channel_id": 2,
+            "destination_guild_id": 3,
+            "destination_channel_id": 4,
+        }
+        with self.assertRaises(ValueError):
+            parse_message_forward_jobs(
+                {
+                    "enabled": True,
+                    "message_filter": "link_or_attachment",
+                    "jobs": [shared_job, shared_job],
+                }
+            )
+
 
 class OneTimeMessageForwardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_runs_jobs_in_configured_order(self):
+        jobs = (
+            settings(job_id="first"),
+            settings(job_id="second"),
+            settings(job_id="third"),
+        )
+        cog = OneTimeMessageForward(SimpleNamespace(), jobs)
+        started_jobs = []
+
+        async def complete_current_job():
+            started_jobs.append(cog.settings.job_id)
+            return True
+
+        cog._run_with_retries = AsyncMock(side_effect=complete_current_job)
+
+        await cog._run_queue()
+
+        self.assertEqual(started_jobs, ["first", "second", "third"])
+
+    async def test_queue_does_not_start_later_jobs_after_failure(self):
+        jobs = (
+            settings(job_id="first"),
+            settings(job_id="second"),
+            settings(job_id="must-not-start"),
+        )
+        cog = OneTimeMessageForward(SimpleNamespace(), jobs)
+        started_jobs = []
+
+        async def run_current_job():
+            started_jobs.append(cog.settings.job_id)
+            return cog.settings.job_id == "first"
+
+        cog._run_with_retries = AsyncMock(side_effect=run_current_job)
+
+        await cog._run_queue()
+
+        self.assertEqual(started_jobs, ["first", "second"])
+
     async def test_cog_load_migrates_existing_job_table_for_filter_identity(self):
         bot = SimpleNamespace(
             RUN=AsyncMock(),
