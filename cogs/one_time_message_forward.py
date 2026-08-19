@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timezone
@@ -35,8 +36,15 @@ CREATE TABLE IF NOT EXISTS one_time_message_forward_jobs (
     status TEXT NOT NULL,
     last_error TEXT,
     started_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+    message_filter TEXT
 );"""
+
+ADD_FORWARD_JOB_FILTER_COLUMN = """
+ALTER TABLE one_time_message_forward_jobs
+ADD COLUMN message_filter TEXT;"""
+
+GET_FORWARD_JOB_COLUMNS = "PRAGMA table_info(one_time_message_forward_jobs);"
 
 CREATE_FORWARD_RESULTS_TABLE = """
 CREATE TABLE IF NOT EXISTS one_time_message_forward_results (
@@ -53,14 +61,14 @@ INSERT_FORWARD_JOB = """
 INSERT INTO one_time_message_forward_jobs (
     job_id, source_guild_id, source_channel_id, first_message_id,
     last_message_id, destination_guild_id, destination_channel_id,
-    destination_scan_after_id, status, started_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    destination_scan_after_id, status, started_at, message_filter
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
 ON CONFLICT(job_id) DO NOTHING;"""
 
 GET_FORWARD_JOB = """
 SELECT source_guild_id, source_channel_id, first_message_id, last_message_id,
        destination_guild_id, destination_channel_id, destination_scan_after_id,
-       status
+       status, message_filter
 FROM one_time_message_forward_jobs
 WHERE job_id = ?;"""
 
@@ -98,6 +106,8 @@ WHERE job_id = ?
 GROUP BY outcome;"""
 
 COMPLETE_STATUSES = {"complete", "complete_with_skips"}
+SUPPORTED_MESSAGE_FILTERS = {"link_or_attachment"}
+HTTP_URL_PATTERN = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
 FORWARDABLE_MESSAGE_TYPES = {
     discord.MessageType.default,
     discord.MessageType.reply,
@@ -126,8 +136,7 @@ class MessageForwardSettings:
     job_id: str
     source_guild_id: int
     source_channel_id: int
-    first_message_id: int
-    last_message_id: int
+    message_filter: str
     destination_guild_id: int
     destination_channel_id: int
     send_delay_seconds: float
@@ -144,10 +153,10 @@ class MessageForwardSettings:
         if not isinstance(job_id, str) or not job_id.strip():
             raise ValueError("job_id must be a non-empty string.")
 
-        first_message_id = _snowflake(data, "first_message_id")
-        last_message_id = _snowflake(data, "last_message_id")
-        if first_message_id > last_message_id:
-            raise ValueError("first_message_id must not be newer than last_message_id.")
+        message_filter = data.get("message_filter")
+        if message_filter not in SUPPORTED_MESSAGE_FILTERS:
+            supported = ", ".join(sorted(SUPPORTED_MESSAGE_FILTERS))
+            raise ValueError(f"message_filter must be one of: {supported}.")
 
         try:
             send_delay_seconds = float(data.get("send_delay_seconds", 1.25))
@@ -170,8 +179,7 @@ class MessageForwardSettings:
             job_id=job_id.strip(),
             source_guild_id=_snowflake(data, "source_guild_id"),
             source_channel_id=_snowflake(data, "source_channel_id"),
-            first_message_id=first_message_id,
-            last_message_id=last_message_id,
+            message_filter=message_filter,
             destination_guild_id=_snowflake(data, "destination_guild_id"),
             destination_channel_id=_snowflake(data, "destination_channel_id"),
             send_delay_seconds=send_delay_seconds,
@@ -203,6 +211,9 @@ class OneTimeMessageForward(commands.Cog):
 
     async def cog_load(self) -> None:
         await self.bot.RUN(CREATE_FORWARD_JOBS_TABLE)
+        job_columns = await self.bot.GET(GET_FORWARD_JOB_COLUMNS)
+        if not any(column[1] == "message_filter" for column in job_columns):
+            await self.bot.RUN(ADD_FORWARD_JOB_FILTER_COLUMN)
         await self.bot.RUN(CREATE_FORWARD_RESULTS_TABLE)
 
     def cog_unload(self) -> None:
@@ -303,8 +314,6 @@ class OneTimeMessageForward(commands.Cog):
     ) -> tuple[
         discord.TextChannel | discord.Thread,
         discord.TextChannel | discord.Thread,
-        discord.Message,
-        discord.Message,
     ]:
         if not self.bot.intents.message_content:
             raise ForwardJobConfigurationError(
@@ -324,40 +333,77 @@ class OneTimeMessageForward(commands.Cog):
             )
         self._check_channel_permissions(source, destination)
 
+        return source, destination
+
+    @staticmethod
+    async def _discover_source_range(
+        source: discord.TextChannel | discord.Thread,
+    ) -> tuple[discord.Message, discord.Message]:
+        first_message = await anext(
+            source.history(limit=1, oldest_first=True),
+            None,
+        )
+        if first_message is None:
+            raise ForwardJobConfigurationError(
+                "The source channel contains no messages to scan."
+            )
+
+        last_message = await anext(source.history(limit=1), None)
+        if last_message is None:
+            raise ForwardJobConfigurationError(
+                "The source channel contains no messages to scan."
+            )
+        return first_message, last_message
+
+    @staticmethod
+    async def _fetch_source_range(
+        source: discord.TextChannel | discord.Thread,
+        first_message_id: int,
+        last_message_id: int,
+    ) -> tuple[discord.Message, discord.Message]:
         try:
-            first_message = await source.fetch_message(self.settings.first_message_id)
-            if self.settings.first_message_id == self.settings.last_message_id:
+            first_message = await source.fetch_message(first_message_id)
+            if first_message_id == last_message_id:
                 last_message = first_message
             else:
-                last_message = await source.fetch_message(self.settings.last_message_id)
+                last_message = await source.fetch_message(last_message_id)
         except discord.NotFound as error:
             raise ForwardJobConfigurationError(
-                "A configured boundary message does not exist in the source channel."
+                "A stored boundary message no longer exists in the source channel."
             ) from error
         except discord.Forbidden as error:
             raise ForwardJobConfigurationError(
-                "The bot cannot read the configured source messages."
+                "The bot cannot read the stored source boundary messages."
             ) from error
 
-        return source, destination, first_message, last_message
+        return first_message, last_message
 
     def _validate_job_record(self, job: tuple) -> None:
         configured_values = (
             self.settings.source_guild_id,
             self.settings.source_channel_id,
-            self.settings.first_message_id,
-            self.settings.last_message_id,
             self.settings.destination_guild_id,
             self.settings.destination_channel_id,
         )
-        if tuple(job[:6]) != configured_values:
+        stored_values = (job[0], job[1], job[4], job[5])
+        if stored_values != configured_values:
             raise ForwardJobConfigurationError(
-                "The job_id already exists with different channel or range settings."
+                "The job_id already exists with different channel settings."
+            )
+        if job[2] > job[3]:
+            raise ForwardJobConfigurationError(
+                "The stored source range has invalid boundary message IDs."
+            )
+        if job[8] != self.settings.message_filter:
+            raise ForwardJobConfigurationError(
+                "The job_id already exists with a different message filter."
             )
 
     async def _initialise_job(
         self,
         destination: discord.TextChannel | discord.Thread,
+        first_message_id: int,
+        last_message_id: int,
     ) -> tuple[str, int | None]:
         started_at = discord.utils.utcnow().astimezone(timezone.utc).isoformat()
         await self.bot.RUN(
@@ -366,12 +412,13 @@ class OneTimeMessageForward(commands.Cog):
                 self.settings.job_id,
                 self.settings.source_guild_id,
                 self.settings.source_channel_id,
-                self.settings.first_message_id,
-                self.settings.last_message_id,
+                first_message_id,
+                last_message_id,
                 self.settings.destination_guild_id,
                 self.settings.destination_channel_id,
                 destination.last_message_id,
                 started_at,
+                self.settings.message_filter,
             ),
         )
         job = await self.bot.GET_ONE(GET_FORWARD_JOB, (self.settings.job_id,))
@@ -409,6 +456,8 @@ class OneTimeMessageForward(commands.Cog):
         self,
         destination: discord.TextChannel | discord.Thread,
         scan_after_id: int | None,
+        first_message_id: int,
+        last_message_id: int,
     ) -> None:
         after = discord.Object(id=scan_after_id) if scan_after_id else None
         async for destination_message in destination.history(
@@ -426,11 +475,7 @@ class OneTimeMessageForward(commands.Cog):
                 continue
             if reference.message_id is None:
                 continue
-            if not (
-                self.settings.first_message_id
-                <= reference.message_id
-                <= self.settings.last_message_id
-            ):
+            if not (first_message_id <= reference.message_id <= last_message_id):
                 continue
             await self._record_result(
                 reference.message_id,
@@ -475,6 +520,15 @@ class OneTimeMessageForward(commands.Cog):
 
         yield last_message
 
+    def _matches_message_filter(self, message: discord.Message) -> bool:
+        if self.settings.message_filter == "link_or_attachment":
+            return bool(message.attachments) or bool(
+                HTTP_URL_PATTERN.search(message.content or "")
+            )
+        raise RuntimeError(
+            f"Unsupported message filter: {self.settings.message_filter}"
+        )
+
     async def _forward_messages(
         self,
         source: discord.TextChannel | discord.Thread,
@@ -487,6 +541,7 @@ class OneTimeMessageForward(commands.Cog):
             (self.settings.job_id,),
         )
         processed_message_ids = {row[0] for row in results}
+        scanned_this_run = 0
         forwarded_this_run = 0
 
         async for message in self._source_messages(
@@ -494,7 +549,19 @@ class OneTimeMessageForward(commands.Cog):
             first_message,
             last_message,
         ):
+            scanned_this_run += 1
+            if scanned_this_run % 1000 == 0:
+                _log.info(
+                    "Forward job %s scanned %s messages in this run; %s forwarded.",
+                    self.settings.job_id,
+                    scanned_this_run,
+                    forwarded_this_run,
+                )
+
             if message.id in processed_message_ids:
+                continue
+
+            if not self._matches_message_filter(message):
                 continue
 
             if message.type not in FORWARDABLE_MESSAGE_TYPES:
@@ -582,15 +649,42 @@ class OneTimeMessageForward(commands.Cog):
                 )
                 return
 
-        source, destination, first_message, last_message = await self._preflight()
-        status, scan_after_id = await self._initialise_job(destination)
+        source, destination = await self._preflight()
+        if existing_job is None:
+            first_message, last_message = await self._discover_source_range(source)
+        else:
+            first_message, last_message = await self._fetch_source_range(
+                source,
+                existing_job[2],
+                existing_job[3],
+            )
+
+        _log.info(
+            "Message-forward job %s %s source range %s-%s with filter %s.",
+            self.settings.job_id,
+            "starting" if existing_job is None else "resuming",
+            first_message.id,
+            last_message.id,
+            self.settings.message_filter,
+        )
+
+        status, scan_after_id = await self._initialise_job(
+            destination,
+            first_message.id,
+            last_message.id,
+        )
         if status in COMPLETE_STATUSES:
             _log.info(
                 "Message-forward job %s is already complete.", self.settings.job_id
             )
             return
 
-        await self._reconcile_destination(destination, scan_after_id)
+        await self._reconcile_destination(
+            destination,
+            scan_after_id,
+            first_message.id,
+            last_message.id,
+        )
         await self._forward_messages(
             source,
             destination,

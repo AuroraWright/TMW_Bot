@@ -1,14 +1,13 @@
 # This job runs once and stores its completion state in the encrypted database.
 enabled: true
-job_id: "forward-819968020012204112-1492793214145527990-1539522871158636585"
+job_id: "forward-links-or-attachments-1055218566967865354-1539535023911469066"
 
 source_guild_id: 617136488840429598
-source_channel_id: 819968020012204112
-first_message_id: 1492793214145527990
-last_message_id: 1539522871158636585
+source_channel_id: 1055218566967865354
+message_filter: "link_or_attachment"
 
 destination_guild_id: 1539508913102262284
-destination_channel_id: 1539512407053967401
+destination_channel_id: 1539535023911469066
 
 # Discord.py also honors Discord's dynamic rate-limit headers. This additional
 # delay keeps the one-time job deliberately below normal message-send rates.

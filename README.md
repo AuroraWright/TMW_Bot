@@ -161,7 +161,9 @@ User Actions:
 
 #### `one_time_message_forward.py`
 
-Runs a configured, resumable one-time native Discord message-forward job. It forwards the inclusive source range in chronological order, deliberately paces sends, and stores checkpoints in the encrypted database so restarts do not replay completed work.
+Runs a configured, resumable one-time native Discord message-forward job. On its first start, it fixes the source range at the latest existing message, scans the channel chronologically, and forwards messages selected by the configured filter. Sends are deliberately paced, and checkpoints are stored in the encrypted database so restarts do not replay completed work.
+
+The `link_or_attachment` filter selects messages containing an HTTP(S) link or any Discord attachment, including images, video, audio, and other files.
 
 No user commands. The one-time job and timing are defined in `config/one_time_message_forward.yml`.
 
