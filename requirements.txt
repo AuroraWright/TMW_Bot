@@ -1,4 +1,4 @@
-discord.py
+discord.py>=2.5,<3
 python-dotenv
 sqlcipher3-binary==0.6.0
 aiohttp

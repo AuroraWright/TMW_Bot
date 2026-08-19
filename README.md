@@ -159,6 +159,14 @@ User Actions:
 
 ---
 
+#### `one_time_message_forward.py`
+
+Runs a configured, resumable one-time native Discord message-forward job. It forwards the inclusive source range in chronological order, deliberately paces sends, and stores checkpoints in the encrypted database so restarts do not replay completed work.
+
+No user commands. The one-time job and timing are defined in `config/one_time_message_forward.yml`.
+
+---
+
 #### `rank_saver.py`
 
 Automatically saves and restores user roles when they leave and rejoin the server. Runs every 10 minutes to save current roles and restores applicable roles when a user rejoins.
