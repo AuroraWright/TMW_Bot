@@ -44,6 +44,13 @@ CREATE_USER_THREADS_TABLE = """
     PRIMARY KEY (user_id)
 );"""
 
+CREATE_QUIZ_MENU_MESSAGES_TABLE = """
+    CREATE TABLE IF NOT EXISTS quiz_menu_messages (
+    guild_id INTEGER PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL
+);"""
+
 ADD_QUIZ_ATTEMPT = """INSERT INTO quiz_attempts (guild_id, user_id, quiz_name, created_at) VALUES (?,?,?,?);"""
 
 GET_LAST_QUIZ_ATTEMPT = """SELECT quiz_name, created_at FROM quiz_attempts
@@ -73,6 +80,18 @@ ADD_USER_THREAD = """INSERT INTO user_threads (user_id, thread_id) VALUES (?, ?)
                      ON CONFLICT(user_id) DO UPDATE SET thread_id = excluded.thread_id;"""
 
 GET_USER_THREAD = """SELECT thread_id FROM user_threads WHERE user_id = ?;"""
+
+GET_QUIZ_MENU_MESSAGE = """SELECT channel_id, message_id
+                           FROM quiz_menu_messages WHERE guild_id = ?;"""
+
+UPSERT_QUIZ_MENU_MESSAGE = """INSERT INTO quiz_menu_messages
+                             (guild_id, channel_id, message_id) VALUES (?, ?, ?)
+                             ON CONFLICT(guild_id) DO UPDATE SET
+                             channel_id = excluded.channel_id,
+                             message_id = excluded.message_id;"""
+
+DELETE_QUIZ_MENU_MESSAGE = """DELETE FROM quiz_menu_messages
+                             WHERE guild_id = ?;"""
 
 
 def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
@@ -105,7 +124,7 @@ def build_ranktable_description(guild: discord.Guild, rank_structure: list[dict]
 
     for heading, role in rank_entries:
         if heading:
-            description_lines.extend(("", f"**{heading}**"))
+            description_lines.append(f"**{heading}**")
 
         percentage = (
             len(role.members) / total_ranked_members * 100
@@ -311,6 +330,11 @@ class DynamicQuizMenu(discord.ui.DynamicItem[discord.ui.Select[discord.ui.View]]
         await interaction.response.edit_message(
             view=create_quiz_menu_view(self.levelup, guild_id)
         )
+        if interaction.message is not None:
+            await self.levelup._record_quiz_menu_message(
+                interaction.message,
+                guild_id,
+            )
         rank = rank_data["name"]
         quiz_command = rank_data["command"]
 
@@ -361,14 +385,115 @@ def create_quiz_menu_view(levelup: "LevelUp", guild_id: int):
 class LevelUp(commands.Cog):
     def __init__(self, bot: TMWBot):
         self.bot = bot
+        self._quiz_menus_refreshed = False
+        self._quiz_menu_refresh_lock = asyncio.Lock()
 
     async def cog_load(self):
         await self.bot.RUN(CREATE_QUIZ_ATTEMPTS_TABLE)
         await self.bot.RUN(CREATE_PASSED_QUIZZES_TABLE)
         await self.bot.RUN(CREATE_USER_THREADS_TABLE)
+        await self.bot.RUN(CREATE_QUIZ_MENU_MESSAGES_TABLE)
         await self.migrate_legacy_quiz_names()
 
         self.bot.add_dynamic_items(DynamicQuizMenu)
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        async with self._quiz_menu_refresh_lock:
+            if self._quiz_menus_refreshed:
+                return
+
+            self._quiz_menus_refreshed = True
+            await self.refresh_quiz_menu_messages()
+
+    @staticmethod
+    def _is_quiz_menu_message(message: discord.Message, guild_id: int):
+        expected_custom_id = f"quizmenu-guild:{guild_id}"
+        return any(
+            getattr(component, "custom_id", None) == expected_custom_id
+            for row in message.components
+            for component in getattr(row, "children", ())
+        )
+
+    async def _record_quiz_menu_message(self, message: discord.Message, guild_id: int):
+        await self.bot.RUN(
+            UPSERT_QUIZ_MENU_MESSAGE,
+            (guild_id, message.channel.id, message.id),
+        )
+
+    async def _edit_quiz_menu_message(self, message: discord.Message, guild_id: int):
+        await message.edit(view=create_quiz_menu_view(self, guild_id))
+        await self._record_quiz_menu_message(message, guild_id)
+        _log.info(
+            "Refreshed quiz menu message %s in guild %s",
+            message.id,
+            guild_id,
+        )
+
+    async def _find_quiz_menu_message(self, channel, guild_id: int):
+        async for message in channel.history(limit=None):
+            if message.author.id != self.bot.user.id:
+                continue
+            if self._is_quiz_menu_message(message, guild_id):
+                return message
+        return None
+
+    async def _refresh_quiz_menu_for_guild(self, guild_id: int, settings: dict):
+        stored_menu = await self.bot.GET_ONE(GET_QUIZ_MENU_MESSAGE, (guild_id,))
+        if stored_menu:
+            channel_id, message_id = stored_menu
+            channel = self.bot.get_channel(channel_id)
+            if channel is not None:
+                try:
+                    message = await channel.fetch_message(message_id)
+                    if self._is_quiz_menu_message(message, guild_id):
+                        await self._edit_quiz_menu_message(message, guild_id)
+                        return True
+                except discord.NotFound:
+                    pass
+                except (discord.Forbidden, discord.HTTPException):
+                    _log.exception(
+                        "Failed to fetch stored quiz menu message %s in guild %s",
+                        message_id,
+                        guild_id,
+                    )
+                    return False
+
+            await self.bot.RUN(DELETE_QUIZ_MENU_MESSAGE, (guild_id,))
+
+        channel_id = settings.get("quiz_channel")
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            _log.warning(
+                "Quiz menu channel %s was not found for guild %s",
+                channel_id,
+                guild_id,
+            )
+            return False
+
+        try:
+            message = await self._find_quiz_menu_message(channel, guild_id)
+            if message is None:
+                _log.warning(
+                    "No existing quiz menu message was found in channel %s for guild %s",
+                    channel_id,
+                    guild_id,
+                )
+                return False
+
+            await self._edit_quiz_menu_message(message, guild_id)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            _log.exception(
+                "Failed to search for a quiz menu message in channel %s for guild %s",
+                channel_id,
+                guild_id,
+            )
+            return False
+
+    async def refresh_quiz_menu_messages(self):
+        for guild_id, settings in gatekeeper_settings["rank_settings"].items():
+            await self._refresh_quiz_menu_for_guild(guild_id, settings)
 
     async def migrate_legacy_quiz_names(self):
         for guild_id, rank_structure in gatekeeper_settings["rank_structure"].items():
@@ -767,10 +892,11 @@ class LevelUp(commands.Cog):
         await interaction.response.send_message("Creating menu...", ephemeral=True)
 
         quiz_menu_message = gatekeeper_settings["rank_settings"][interaction.guild.id]["quiz_menu_message"]
-        await interaction.channel.send(
+        message = await interaction.channel.send(
             quiz_menu_message,
             view=create_quiz_menu_view(self, interaction.guild.id),
         )
+        await self._record_quiz_menu_message(message, interaction.guild.id)
 
 
 async def setup(bot):

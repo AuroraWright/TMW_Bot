@@ -7,6 +7,7 @@ from cogs.gatekeeper import (
     COPY_RENAMED_PASSED_QUIZZES,
     DELETE_RENAMED_PASSED_QUIZZES,
     RENAME_QUIZ_ATTEMPTS,
+    UPSERT_QUIZ_MENU_MESSAGE,
     DynamicQuizMenu,
     LevelUp,
     build_ranktable_description,
@@ -99,6 +100,7 @@ class GatekeeperNamingTests(unittest.IsolatedAsyncioTestCase):
         levelup.is_on_cooldown_create = AsyncMock(
             return_value=(True, "Still on cooldown")
         )
+        levelup._record_quiz_menu_message = AsyncMock()
         response = SimpleNamespace(
             edit_message=AsyncMock(),
             send_message=AsyncMock(),
@@ -106,6 +108,7 @@ class GatekeeperNamingTests(unittest.IsolatedAsyncioTestCase):
         interaction = SimpleNamespace(
             data={"custom_id": "quizmenu-guild:1"},
             guild=SimpleNamespace(id=1),
+            message=SimpleNamespace(id=500),
             user=SimpleNamespace(id=100),
             response=response,
             followup=SimpleNamespace(send=AsyncMock()),
@@ -119,6 +122,10 @@ class GatekeeperNamingTests(unittest.IsolatedAsyncioTestCase):
         response.edit_message.assert_awaited_once()
         response.send_message.assert_not_awaited()
         levelup.rank_has_cooldown.assert_awaited_once_with(1, "Current Rank")
+        levelup._record_quiz_menu_message.assert_awaited_once_with(
+            interaction.message,
+            1,
+        )
         interaction.followup.send.assert_awaited_once_with(
             "Still on cooldown",
             ephemeral=True,
@@ -160,6 +167,92 @@ class GatekeeperNamingTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_startup_finds_and_edits_existing_quiz_menu_message(self):
+        settings = {
+            "rank_structure": {
+                1: [
+                    {
+                        "name": "Current Rank",
+                        "emoji": None,
+                        "command": "quiz command",
+                    }
+                ]
+            },
+            "rank_settings": {1: {"quiz_channel": 50}},
+        }
+        menu_component = SimpleNamespace(custom_id="quizmenu-guild:1")
+        message = SimpleNamespace(
+            id=500,
+            author=SimpleNamespace(id=999),
+            channel=SimpleNamespace(id=50),
+            components=[SimpleNamespace(children=[menu_component])],
+            edit=AsyncMock(),
+        )
+
+        async def channel_history(*, limit):
+            self.assertIsNone(limit)
+            yield message
+
+        channel = SimpleNamespace(id=50, history=channel_history)
+        bot = Mock(user=SimpleNamespace(id=999))
+        bot.GET_ONE = AsyncMock(return_value=None)
+        bot.RUN = AsyncMock()
+        bot.get_channel.return_value = channel
+        cog = LevelUp(bot)
+
+        with patch.object(gatekeeper, "gatekeeper_settings", settings):
+            await cog.refresh_quiz_menu_messages()
+
+        message.edit.assert_awaited_once()
+        refreshed_view = message.edit.await_args.kwargs["view"]
+        self.assertEqual(
+            refreshed_view.children[0].item.options[0].label, "Current Rank"
+        )
+        bot.RUN.assert_awaited_once_with(
+            UPSERT_QUIZ_MENU_MESSAGE,
+            (1, 50, 500),
+        )
+
+    async def test_later_startups_fetch_the_recorded_menu_directly(self):
+        settings = {
+            "rank_structure": {
+                1: [
+                    {
+                        "name": "Current Rank",
+                        "emoji": None,
+                        "command": "quiz command",
+                    }
+                ]
+            },
+            "rank_settings": {1: {"quiz_channel": 50}},
+        }
+        message = SimpleNamespace(
+            id=500,
+            channel=SimpleNamespace(id=50),
+            components=[
+                SimpleNamespace(
+                    children=[SimpleNamespace(custom_id="quizmenu-guild:1")]
+                )
+            ],
+            edit=AsyncMock(),
+        )
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=message))
+        bot = Mock(user=SimpleNamespace(id=999))
+        bot.GET_ONE = AsyncMock(return_value=(50, 500))
+        bot.RUN = AsyncMock()
+        bot.get_channel.return_value = channel
+        cog = LevelUp(bot)
+
+        with patch.object(gatekeeper, "gatekeeper_settings", settings):
+            await cog.refresh_quiz_menu_messages()
+
+        channel.fetch_message.assert_awaited_once_with(500)
+        message.edit.assert_awaited_once()
+        bot.RUN.assert_awaited_once_with(
+            UPSERT_QUIZ_MENU_MESSAGE,
+            (1, 50, 500),
+        )
+
 
 class RanktableTests(unittest.TestCase):
     def test_configured_heading_is_rendered_before_its_rank(self):
@@ -184,7 +277,6 @@ class RanktableTests(unittest.TestCase):
             description.splitlines(),
             [
                 "<@&10>: 2 (100.00%)",
-                "",
                 "**Bonus Ranks**",
                 "<@&20>: 1 (50.00%)",
                 "<@&30>: 0 (0.00%)",
