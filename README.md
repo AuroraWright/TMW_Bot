@@ -159,16 +159,6 @@ User Actions:
 
 ---
 
-#### `one_time_message_forward.py`
-
-Runs an ordered queue of configured, resumable one-time native Discord message-forward jobs. Only one job runs at a time, and a later job cannot start until every earlier job has completed. On its first start, each job fixes its source range at the latest existing message, scans the channel chronologically, and forwards messages selected by the configured filter. Sends are deliberately paced, and checkpoints are stored in the encrypted database so restarts do not replay completed work.
-
-The `link_or_attachment` filter selects messages containing an HTTP(S) link or any Discord attachment, including images, video, audio, and other files.
-
-No user commands. The one-time job and timing are defined in `config/one_time_message_forward.yml`.
-
----
-
 #### `rank_saver.py`
 
 Automatically saves and restores user roles when they leave and rejoin the server. Runs every 10 minutes to save current roles and restores applicable roles when a user rejoins.
@@ -192,7 +182,7 @@ Note: Requires configuration in `selfmute_settings.yml` to define mute roles and
 
 #### `sub_server_access.py`
 
-Restricts configured sub-servers to members who are still in the main server and have the configured Sharing role. Ineligible users are kicked immediately, users banned from the main server are banned from every sub-server, and existing members are checked whenever the bot starts.
+Restricts configured sub-servers to members who are still in the main server and have the configured Sharing role. Ineligible users are kicked immediately, and main-server bans and unbans are mirrored to every sub-server. Mirrored bans are tracked so offline unbans can be repaired at startup without removing unrelated sub-server bans. Existing members are also checked whenever the bot starts.
 
 No user commands - fully automatic. Server and role IDs are defined in `config/sub_server_settings.yml`. The bot needs the Server Members intent, Ban Members in the main server (to identify existing bans), and Kick Members and Ban Members in each sub-server.
 

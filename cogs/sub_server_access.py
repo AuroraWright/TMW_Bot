@@ -18,6 +18,33 @@ SUB_SERVER_SETTINGS_PATH = Path(
     os.getenv("ALT_SUB_SERVER_SETTINGS_PATH", "config/sub_server_settings.yml")
 )
 
+CREATE_MIRRORED_BANS_TABLE = """
+CREATE TABLE IF NOT EXISTS sub_server_mirrored_bans (
+    main_guild_id INTEGER NOT NULL,
+    sub_guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (main_guild_id, sub_guild_id, user_id)
+);"""
+
+RECORD_MIRRORED_BAN = """
+INSERT INTO sub_server_mirrored_bans (main_guild_id, sub_guild_id, user_id)
+VALUES (?, ?, ?)
+ON CONFLICT(main_guild_id, sub_guild_id, user_id) DO NOTHING;"""
+
+DELETE_MIRRORED_BAN = """
+DELETE FROM sub_server_mirrored_bans
+WHERE main_guild_id = ? AND sub_guild_id = ? AND user_id = ?;"""
+
+GET_MIRRORED_BANS = """
+SELECT sub_guild_id, user_id
+FROM sub_server_mirrored_bans
+WHERE main_guild_id = ?;"""
+
+HAS_MIRRORED_BAN = """
+SELECT 1
+FROM sub_server_mirrored_bans
+WHERE main_guild_id = ? AND sub_guild_id = ? AND user_id = ?;"""
+
 
 @dataclass(frozen=True)
 class SubServerSettings:
@@ -85,7 +112,11 @@ class SubServerAccess(commands.Cog):
     ):
         self.bot = bot
         self.settings = settings
+        self._ban_sync_lock = asyncio.Lock()
         self._reconciliation_lock = asyncio.Lock()
+
+    async def cog_load(self) -> None:
+        await self.bot.RUN(CREATE_MIRRORED_BANS_TABLE)
 
     def _get_main_guild(self) -> discord.Guild | None:
         return self.bot.get_guild(self.settings.main_guild_id)
@@ -187,7 +218,7 @@ class SubServerAccess(commands.Cog):
         sub_guild: discord.Guild,
         user_id: int,
         reason: str,
-    ) -> None:
+    ) -> bool:
         try:
             await sub_guild.ban(discord.Object(id=user_id), reason=reason)
         except (discord.Forbidden, discord.HTTPException) as error:
@@ -197,6 +228,76 @@ class SubServerAccess(commands.Cog):
                 sub_guild.id,
                 error,
             )
+            return False
+        return True
+
+    async def _unban_from_sub_guild(
+        self,
+        sub_guild: discord.Guild,
+        user_id: int,
+        reason: str,
+    ) -> bool:
+        try:
+            await sub_guild.unban(discord.Object(id=user_id), reason=reason)
+        except discord.NotFound:
+            return True
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.error(
+                "Failed to unban user %s from sub-server %s: %s",
+                user_id,
+                sub_guild.id,
+                error,
+            )
+            return False
+        return True
+
+    async def _record_mirrored_ban(
+        self,
+        sub_guild_id: int,
+        user_id: int,
+    ) -> None:
+        await self.bot.RUN(
+            RECORD_MIRRORED_BAN,
+            (self.settings.main_guild_id, sub_guild_id, user_id),
+        )
+
+    async def _delete_mirrored_ban(
+        self,
+        sub_guild_id: int,
+        user_id: int,
+    ) -> None:
+        await self.bot.RUN(
+            DELETE_MIRRORED_BAN,
+            (self.settings.main_guild_id, sub_guild_id, user_id),
+        )
+
+    async def _mirror_main_ban(
+        self,
+        sub_guild: discord.Guild,
+        user_id: int,
+        reason: str,
+    ) -> None:
+        if await self._ban_from_sub_guild(sub_guild, user_id, reason):
+            await self._record_mirrored_ban(sub_guild.id, user_id)
+
+    async def _remove_mirrored_ban(
+        self,
+        sub_guild: discord.Guild,
+        user_id: int,
+        reason: str,
+        *,
+        known_tracked: bool = False,
+    ) -> None:
+        if not known_tracked:
+            tracked = await self.bot.GET_ONE(
+                HAS_MIRRORED_BAN,
+                (self.settings.main_guild_id, sub_guild.id, user_id),
+            )
+            if tracked is None:
+                return
+
+        if await self._unban_from_sub_guild(sub_guild, user_id, reason):
+            await self._delete_mirrored_ban(sub_guild.id, user_id)
 
     async def _enforce_sub_member(self, member: discord.Member) -> None:
         if self._is_bot_user(member.id):
@@ -213,7 +314,7 @@ class SubServerAccess(commands.Cog):
             )
             return
         if access_status is AccessStatus.BANNED_FROM_MAIN_GUILD:
-            await self._ban_from_sub_guild(
+            await self._mirror_main_ban(
                 member.guild,
                 member.id,
                 "User is banned from the main server.",
@@ -251,6 +352,10 @@ class SubServerAccess(commands.Cog):
             return None
 
     async def synchronize_main_guild_bans(self) -> None:
+        async with self._ban_sync_lock:
+            await self._synchronize_main_guild_bans()
+
+    async def _synchronize_main_guild_bans(self) -> None:
         sub_guilds = self._get_sub_guilds()
         if not sub_guilds:
             return
@@ -267,17 +372,42 @@ class SubServerAccess(commands.Cog):
         if main_bans is None:
             return
 
+        mirrored_bans = await self.bot.GET(
+            GET_MIRRORED_BANS,
+            (self.settings.main_guild_id,),
+        )
+        mirrored_bans_by_sub_guild: dict[int, set[int]] = {}
+        for sub_guild_id, user_id in mirrored_bans:
+            mirrored_bans_by_sub_guild.setdefault(sub_guild_id, set()).add(user_id)
+
         for sub_guild in sub_guilds:
             sub_guild_bans = await self._get_banned_user_ids(sub_guild)
             if sub_guild_bans is None:
                 continue
 
+            stale_mirrored_bans = (
+                mirrored_bans_by_sub_guild.get(sub_guild.id, set()) - main_bans
+            )
+            for user_id in stale_mirrored_bans:
+                if user_id in sub_guild_bans:
+                    await self._remove_mirrored_ban(
+                        sub_guild,
+                        user_id,
+                        "User is no longer banned from the main server.",
+                        known_tracked=True,
+                    )
+                else:
+                    await self._delete_mirrored_ban(sub_guild.id, user_id)
+
             for user_id in main_bans - sub_guild_bans:
-                await self._ban_from_sub_guild(
+                await self._mirror_main_ban(
                     sub_guild,
                     user_id,
                     "User is banned from the main server.",
                 )
+
+            for user_id in main_bans & sub_guild_bans:
+                await self._record_mirrored_ban(sub_guild.id, user_id)
 
     async def reconcile_all_sub_guilds(self) -> None:
         async with self._reconciliation_lock:
@@ -337,12 +467,32 @@ class SubServerAccess(commands.Cog):
         if self._is_bot_user(user.id):
             return
 
-        for sub_guild in self._get_sub_guilds():
-            await self._ban_from_sub_guild(
-                sub_guild,
-                user.id,
-                "User was banned from the main server.",
-            )
+        async with self._ban_sync_lock:
+            for sub_guild in self._get_sub_guilds():
+                await self._mirror_main_ban(
+                    sub_guild,
+                    user.id,
+                    "User was banned from the main server.",
+                )
+
+    @commands.Cog.listener()
+    async def on_member_unban(
+        self,
+        guild: discord.Guild,
+        user: discord.User,
+    ) -> None:
+        if guild.id != self.settings.main_guild_id:
+            return
+        if self._is_bot_user(user.id):
+            return
+
+        async with self._ban_sync_lock:
+            for sub_guild in self._get_sub_guilds():
+                await self._remove_mirrored_ban(
+                    sub_guild,
+                    user.id,
+                    "User was unbanned from the main server.",
+                )
 
     @commands.Cog.listener()
     async def on_member_update(

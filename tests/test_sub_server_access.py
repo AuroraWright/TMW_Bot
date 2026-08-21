@@ -26,9 +26,13 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
         self.sub_guild = Mock(id=SUB_GUILD_ID, members=[])
         self.sub_guild.kick = AsyncMock()
         self.sub_guild.ban = AsyncMock()
+        self.sub_guild.unban = AsyncMock()
 
         self.bot = Mock()
         self.bot.user = SimpleNamespace(id=999)
+        self.bot.RUN = AsyncMock()
+        self.bot.GET = AsyncMock(return_value=[])
+        self.bot.GET_ONE = AsyncMock(return_value=(1,))
         self.bot.get_guild.side_effect = {
             MAIN_GUILD_ID: self.main_guild,
             SUB_GUILD_ID: self.sub_guild,
@@ -47,6 +51,14 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
     def make_sub_member(self):
         return SimpleNamespace(id=USER_ID, guild=self.sub_guild)
+
+    async def test_cog_load_creates_mirrored_ban_tracking_table(self):
+        await self.cog.cog_load()
+
+        create_query = self.bot.RUN.await_args.args[0]
+        self.assertIn(
+            "CREATE TABLE IF NOT EXISTS sub_server_mirrored_bans", create_query
+        )
 
     async def test_sharing_role_is_eligible(self):
         member = self.make_main_member([make_role(1, 0), self.sharing_role])
@@ -104,6 +116,24 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
         banned_user = self.sub_guild.ban.await_args.args[0]
         self.assertEqual(banned_user.id, USER_ID)
 
+    async def test_main_server_unban_removes_mirrored_sub_server_ban(self):
+        user = SimpleNamespace(id=USER_ID)
+
+        await self.cog.on_member_unban(self.main_guild, user)
+
+        unbanned_user = self.sub_guild.unban.await_args.args[0]
+        self.assertEqual(unbanned_user.id, USER_ID)
+        delete_query = self.bot.RUN.await_args.args[0]
+        self.assertIn("DELETE FROM sub_server_mirrored_bans", delete_query)
+
+    async def test_main_server_unban_preserves_untracked_local_sub_server_ban(self):
+        self.bot.GET_ONE.return_value = None
+        user = SimpleNamespace(id=USER_ID)
+
+        await self.cog.on_member_unban(self.main_guild, user)
+
+        self.sub_guild.unban.assert_not_awaited()
+
     async def test_existing_main_server_bans_are_synchronized(self):
         async def main_bans(limit):
             self.assertIsNone(limit)
@@ -121,6 +151,58 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
         banned_user = self.sub_guild.ban.await_args.args[0]
         self.assertEqual(banned_user.id, USER_ID)
+
+    async def test_existing_main_ban_already_in_sub_server_is_tracked(self):
+        async def bans(limit):
+            self.assertIsNone(limit)
+            yield SimpleNamespace(user=SimpleNamespace(id=USER_ID))
+
+        self.main_guild.bans = bans
+        self.sub_guild.bans = bans
+
+        await self.cog.synchronize_main_guild_bans()
+
+        self.sub_guild.ban.assert_not_awaited()
+        record_query = self.bot.RUN.await_args.args[0]
+        self.assertIn("INSERT INTO sub_server_mirrored_bans", record_query)
+
+    async def test_offline_main_unban_is_reconciled_on_startup(self):
+        async def main_bans(limit):
+            self.assertIsNone(limit)
+            if False:
+                yield
+
+        async def sub_server_bans(limit):
+            self.assertIsNone(limit)
+            yield SimpleNamespace(user=SimpleNamespace(id=USER_ID))
+
+        self.main_guild.bans = main_bans
+        self.sub_guild.bans = sub_server_bans
+        self.bot.GET.return_value = [(SUB_GUILD_ID, USER_ID)]
+
+        await self.cog.synchronize_main_guild_bans()
+
+        unbanned_user = self.sub_guild.unban.await_args.args[0]
+        self.assertEqual(unbanned_user.id, USER_ID)
+        delete_query = self.bot.RUN.await_args.args[0]
+        self.assertIn("DELETE FROM sub_server_mirrored_bans", delete_query)
+
+    async def test_startup_preserves_untracked_local_sub_server_ban(self):
+        async def main_bans(limit):
+            self.assertIsNone(limit)
+            if False:
+                yield
+
+        async def sub_server_bans(limit):
+            self.assertIsNone(limit)
+            yield SimpleNamespace(user=SimpleNamespace(id=USER_ID))
+
+        self.main_guild.bans = main_bans
+        self.sub_guild.bans = sub_server_bans
+
+        await self.cog.synchronize_main_guild_bans()
+
+        self.sub_guild.unban.assert_not_awaited()
 
     async def test_losing_required_role_kicks_user_from_sub_server(self):
         before = self.make_main_member([self.sharing_role])
