@@ -9,7 +9,7 @@ Multi-purpose Discord bot developed for the TMW Discord server. The bot is desig
 
 #### `auto_receive.py`
 
-Lets admins set roles which automatically get assigned another role. For example, if a user has 'Eternal Idol' role they get the 'Custom Role' role, which gives more permissions like creating custom roles.
+Lets admins configure roles which automatically grant one or more other roles. Qualifying role changes are handled immediately, while a periodic reconciliation task backfills any assignments missed while the bot was offline. Existing destination roles are detected and are not added again.
 
 Commands:
 * `/_add_auto_receive` `<role_to_have>` `<role_to_get>` - Set up automatic role assignment. Users with `role_to_have` will automatically receive `role_to_get`.
