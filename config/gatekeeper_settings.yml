@@ -197,6 +197,7 @@ rank_structure:
       no_timeout: false
 
     - name: "Immortal Idol"
+      ranktable_heading: "Bonus Ranks"
       emoji: <:immortal:1341420416652017756>
       require_role: 1026918224266280960
       combination_rank: false
@@ -217,7 +218,9 @@ rank_structure:
       command: "k!quiz imm_nandoku+haado+insane+j1k nd hardcore 50 dauq=1 font=5 atl=16 mmq=10 color=#f173ff size=100 effect=antiocr"
       no_timeout: false
 
-    - name: "TMW Owner"
+    - name: "Mythic Idol"
+      legacy_names:
+        - "TMW Owner"
       emoji: <:owner:1341420440442114130>
       require_role: null
       combination_rank: false

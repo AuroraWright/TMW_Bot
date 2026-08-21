@@ -58,10 +58,72 @@ ADD_PASSED_QUIZ = """INSERT INTO passed_quizzes (guild_id, user_id, quiz_name) V
 
 GET_PASSED_QUIZZES = """SELECT quiz_name FROM passed_quizzes WHERE guild_id = ? AND user_id = ?;"""
 
+RENAME_QUIZ_ATTEMPTS = """UPDATE quiz_attempts SET quiz_name = ?
+                        WHERE guild_id = ? AND quiz_name = ?;"""
+
+COPY_RENAMED_PASSED_QUIZZES = """INSERT OR IGNORE INTO passed_quizzes
+                                (guild_id, user_id, quiz_name)
+                                SELECT guild_id, user_id, ? FROM passed_quizzes
+                                WHERE guild_id = ? AND quiz_name = ?;"""
+
+DELETE_RENAMED_PASSED_QUIZZES = """DELETE FROM passed_quizzes
+                                  WHERE guild_id = ? AND quiz_name = ?;"""
+
 ADD_USER_THREAD = """INSERT INTO user_threads (user_id, thread_id) VALUES (?, ?)
                      ON CONFLICT(user_id) DO UPDATE SET thread_id = excluded.thread_id;"""
 
 GET_USER_THREAD = """SELECT thread_id FROM user_threads WHERE user_id = ?;"""
+
+
+def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
+    if rank_name is None:
+        return None
+
+    normalized_name = rank_name.casefold()
+    for rank in rank_structure:
+        accepted_names = [rank["name"], *rank.get("legacy_names", [])]
+        if any(name.casefold() == normalized_name for name in accepted_names):
+            return rank
+    return None
+
+
+def build_ranktable_description(guild: discord.Guild, rank_structure: list[dict]):
+    rank_entries = []
+    for rank in rank_structure:
+        role_id = rank.get("rank_to_get")
+        if role_id is None:
+            continue
+
+        role = guild.get_role(role_id)
+        if role is not None:
+            rank_entries.append((rank.get("ranktable_heading"), role))
+
+    total_ranked_members = len(
+        {member.id for _, role in rank_entries for member in role.members}
+    )
+    description_lines = []
+
+    for heading, role in rank_entries:
+        if heading:
+            description_lines.extend(("", f"**{heading}**"))
+
+        percentage = (
+            len(role.members) / total_ranked_members * 100
+            if total_ranked_members
+            else 0
+        )
+        description_lines.append(
+            f"{role.mention}: {len(role.members)} ({percentage:.2f}%)"
+        )
+
+    description_lines.extend(
+        (
+            "",
+            f"Total ranked members: {total_ranked_members}",
+            f"Total member count: {guild.member_count}",
+        )
+    )
+    return "\n".join(description_lines)
 
 
 async def quiz_autocomplete(interaction: discord.Interaction, current_input: str):
@@ -235,17 +297,22 @@ class DynamicQuizMenu(discord.ui.DynamicItem[discord.ui.Select[discord.ui.View]]
         return cls(levelup, guild_id)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.defer()
         assert interaction.data is not None and "custom_id" in interaction.data, "Invalid interaction data"
-        rank = self.item.values[0]
         guild_id = interaction.guild.id
         rank_structure = gatekeeper_settings["rank_structure"][guild_id]
-        quiz_command = None
+        rank_data = find_rank_by_name(rank_structure, self.item.values[0])
+        if rank_data is None:
+            await interaction.response.send_message(
+                "That quiz is no longer available. Please select another option.",
+                ephemeral=True,
+            )
+            return
 
-        for quiz in rank_structure:
-            if quiz["name"].lower() == rank.lower():
-                quiz_command = quiz["command"]
-                break
+        await interaction.response.edit_message(
+            view=create_quiz_menu_view(self.levelup, guild_id)
+        )
+        rank = rank_data["name"]
+        quiz_command = rank_data["command"]
 
         rank_has_cooldown = await self.levelup.rank_has_cooldown(interaction.guild.id, rank)
         is_on_cooldown, cooldown_message = await self.levelup.is_on_cooldown_create(interaction.user, rank, rank_has_cooldown)
@@ -285,6 +352,12 @@ class DynamicQuizMenu(discord.ui.DynamicItem[discord.ui.Select[discord.ui.View]]
         await quiz_thread.send(f"{quiz_command}")
 
 
+def create_quiz_menu_view(levelup: "LevelUp", guild_id: int):
+    view = discord.ui.View(timeout=None)
+    view.add_item(DynamicQuizMenu(levelup, guild_id))
+    return view
+
+
 class LevelUp(commands.Cog):
     def __init__(self, bot: TMWBot):
         self.bot = bot
@@ -293,8 +366,30 @@ class LevelUp(commands.Cog):
         await self.bot.RUN(CREATE_QUIZ_ATTEMPTS_TABLE)
         await self.bot.RUN(CREATE_PASSED_QUIZZES_TABLE)
         await self.bot.RUN(CREATE_USER_THREADS_TABLE)
+        await self.migrate_legacy_quiz_names()
 
         self.bot.add_dynamic_items(DynamicQuizMenu)
+
+    async def migrate_legacy_quiz_names(self):
+        for guild_id, rank_structure in gatekeeper_settings["rank_structure"].items():
+            for rank in rank_structure:
+                current_name = rank["name"]
+                for legacy_name in rank.get("legacy_names", []):
+                    if legacy_name == current_name:
+                        continue
+
+                    await self.bot.RUN(
+                        RENAME_QUIZ_ATTEMPTS,
+                        (current_name, guild_id, legacy_name),
+                    )
+                    await self.bot.RUN(
+                        COPY_RENAMED_PASSED_QUIZZES,
+                        (current_name, guild_id, legacy_name),
+                    )
+                    await self.bot.RUN(
+                        DELETE_RENAMED_PASSED_QUIZZES,
+                        (guild_id, legacy_name),
+                    )
 
     async def is_in_levelup_channel(self, message: discord.Message):
         thread_id = await self.bot.GET_ONE(GET_USER_THREAD, (message.author.id,))
@@ -317,9 +412,9 @@ class LevelUp(commands.Cog):
 
     async def rank_has_cooldown(self, guild_id: int, rank_name: str):
         rank_structure = gatekeeper_settings["rank_structure"][guild_id]
-        for rank in rank_structure:
-            if rank["name"] == rank_name:
-                return not rank["no_timeout"]
+        rank = find_rank_by_name(rank_structure, rank_name)
+        if rank is not None:
+            return not rank["no_timeout"]
 
     async def is_command_input_valid(self, message: discord.Message):
         if message.author.bot:
@@ -551,24 +646,24 @@ class LevelUp(commands.Cog):
             await self.bot.RUN(RESET_ALL_QUIZ_ATTEMPTS, (interaction.guild.id, user.id))
             await interaction.response.send_message(f"Cleared all quiz cooldown for {user.mention}.")
         else:
-            if not any(quiz_to_reset in rank["name"] for rank in gatekeeper_settings["rank_structure"][interaction.guild.id]):
+            rank_structure = gatekeeper_settings["rank_structure"][interaction.guild.id]
+            rank = find_rank_by_name(rank_structure, quiz_to_reset)
+            if rank is None:
                 await interaction.response.send_message("Invalid quiz name.", ephemeral=True)
                 return
-            await self.bot.RUN(RESET_SPECIFIC_QUIZ_ATTEMPTS, (interaction.guild.id, user.id, quiz_to_reset))
-            await interaction.response.send_message(f"Cleared quiz cooldown for {user.mention} for `{quiz_to_reset}`.")
+            await self.bot.RUN(
+                RESET_SPECIFIC_QUIZ_ATTEMPTS,
+                (interaction.guild.id, user.id, rank["name"]),
+            )
+            await interaction.response.send_message(
+                f"Cleared quiz cooldown for {user.mention} for `{rank['name']}`."
+            )
 
     @discord.app_commands.command(name="ranktable", description="Display the distribution of quiz roles in the server.")
     @discord.app_commands.guild_only()
     async def ranktable(self, interaction: discord.Interaction):
-        quiz_roles = await self.get_all_quiz_roles(interaction.guild)
-        total_ranked_members = len(
-            set([member for role in quiz_roles for member in role.members]))
-
-        description = "\n".join(
-            [f"{role.mention}: {len(role.members)} ({len(role.members) / total_ranked_members * 100:.2f}%)" for role in quiz_roles])
-
-        description += f"\n\nTotal ranked members: {total_ranked_members}"
-        description += f"\nTotal member count: {interaction.guild.member_count}"
+        rank_structure = gatekeeper_settings["rank_structure"][interaction.guild.id]
+        description = build_ranktable_description(interaction.guild, rank_structure)
 
         embed = discord.Embed(title=f"Role Distribution",
                               description=description, color=discord.Color.blurple())
@@ -671,10 +766,11 @@ class LevelUp(commands.Cog):
     async def create_quiz_menu(self, interaction: discord.Interaction):
         await interaction.response.send_message("Creating menu...", ephemeral=True)
 
-        view = discord.ui.View(timeout=None)
-        view.add_item(DynamicQuizMenu(self, interaction.guild.id))
         quiz_menu_message = gatekeeper_settings["rank_settings"][interaction.guild.id]["quiz_menu_message"]
-        await interaction.channel.send(quiz_menu_message, view=view)
+        await interaction.channel.send(
+            quiz_menu_message,
+            view=create_quiz_menu_view(self, interaction.guild.id),
+        )
 
 
 async def setup(bot):
