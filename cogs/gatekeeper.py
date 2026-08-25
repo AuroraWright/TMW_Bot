@@ -152,6 +152,20 @@ async def quiz_autocomplete(interaction: discord.Interaction, current_input: str
         name=rank_name, value=rank_name) for rank_name in rank_names]
     return possible_choices[0:25]
 
+async def assign_quiz_autocomplete(interaction: discord.Interaction, current_input: str):
+    """Autocomplete for the assign_quiz command, showing all base quizzes."""
+    # We want to include all quizzes that aren't combination ranks (e.g., GN1, Prima Idol Vocab, Student)
+    rank_names = [
+        quiz["name"] for quiz in gatekeeper_settings["rank_structure"][interaction.guild.id] 
+        if quiz["combination_rank"] is False
+    ]
+    
+    # Filter choices by the user's current input
+    possible_choices = [
+        discord.app_commands.Choice(name=rank_name, value=rank_name) 
+        for rank_name in rank_names if current_input.casefold() in rank_name.casefold()
+    ]
+    return possible_choices[:25]
 
 async def verify_quiz_settings(quiz_data, quiz_result, member: discord.Member):
     """Ensures a user didn't use cheat settings for the quiz."""
@@ -783,6 +797,36 @@ class LevelUp(commands.Cog):
             await interaction.response.send_message(
                 f"Cleared quiz cooldown for {user.mention} for `{rank['name']}`."
             )
+
+    @discord.app_commands.command(name="assign_quiz", description="Manually assign a passed quiz to a user.")
+    @discord.app_commands.guild_only()
+    @discord.app_commands.describe(user="The user to reward.", quiz_name="The name of the quiz to assign.")
+    @discord.app_commands.autocomplete(quiz_name=assign_quiz_autocomplete)
+    @discord.app_commands.default_permissions(administrator=True)
+    async def assign_quiz(self, interaction: discord.Interaction, user: discord.Member, quiz_name: str):
+        rank_structure = gatekeeper_settings["rank_structure"][interaction.guild.id]
+        quiz_data = find_rank_by_name(rank_structure, quiz_name)
+
+        if quiz_data is None:
+            await interaction.response.send_message("Invalid quiz name.", ephemeral=True)
+            return
+
+        if quiz_data.get("combination_rank"):
+            await interaction.response.send_message(
+                "Combination ranks cannot be assigned directly. Please assign the required individual quizzes instead.", 
+                ephemeral=True
+            )
+            return
+
+        # Defer response to allow time for API role assignments and DB queries
+        await interaction.response.defer(ephemeral=True)
+        should_announce = await self.reward_user(user, quiz_data)
+        
+        if should_announce:
+            announce_msg = f"{user.mention} has passed the {quiz_data['name']} quiz!"
+            await self.send_in_announcement_channel(user, announce_msg)
+
+        await interaction.followup.send(f"Successfully assigned the `{quiz_data['name']}` quiz to {user.mention}.", ephemeral=True)
 
     @discord.app_commands.command(name="ranktable", description="Display the distribution of quiz roles in the server.")
     @discord.app_commands.guild_only()
