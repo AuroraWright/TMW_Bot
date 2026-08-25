@@ -1,17 +1,18 @@
-from lib.bot import TMWBot
-import discord
-import io
-import re
-import aiohttp
 import asyncio
-import yaml
-import os
+import io
 import logging
-from typing import Optional
+import os
+import re
 from datetime import datetime, timedelta, timezone
-from discord.ext import commands, tasks
+from typing import Optional
+
+import aiohttp
+import discord
+import yaml
+from discord.ext import commands
 from discord.utils import utcnow
 
+from lib.bot import TMWBot
 
 _log = logging.getLogger(__name__)
 
@@ -93,6 +94,16 @@ UPSERT_QUIZ_MENU_MESSAGE = """INSERT INTO quiz_menu_messages
 DELETE_QUIZ_MENU_MESSAGE = """DELETE FROM quiz_menu_messages
                              WHERE guild_id = ?;"""
 
+MANUALLY_ASSIGNABLE_QUIZ_NAMES = frozenset(
+    {
+        "GN1",
+        "GN2",
+        "Prima Idol Vocab",
+        "Divine Idol Vocab",
+        "Eternal Idol Vocab",
+    }
+)
+
 
 def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
     if rank_name is None:
@@ -104,6 +115,15 @@ def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
         if any(name.casefold() == normalized_name for name in accepted_names):
             return rank
     return None
+
+
+def is_manually_assignable_quiz(quiz_data: dict) -> bool:
+    """Return whether admins may manually record this component quiz pass."""
+    return (
+        quiz_data["name"] in MANUALLY_ASSIGNABLE_QUIZ_NAMES
+        and not quiz_data.get("combination_rank", False)
+        and quiz_data.get("rank_to_get") is None
+    )
 
 
 def build_ranktable_description(guild: discord.Guild, rank_structure: list[dict]):
@@ -152,20 +172,20 @@ async def quiz_autocomplete(interaction: discord.Interaction, current_input: str
         name=rank_name, value=rank_name) for rank_name in rank_names]
     return possible_choices[0:25]
 
+
 async def assign_quiz_autocomplete(interaction: discord.Interaction, current_input: str):
-    """Autocomplete for the assign_quiz command, showing all base quizzes."""
-    # We want to include all quizzes that aren't combination ranks (e.g., GN1, Prima Idol Vocab, Student)
-    rank_names = [
-        quiz["name"] for quiz in gatekeeper_settings["rank_structure"][interaction.guild.id] 
-        if quiz["combination_rank"] is False
+    """Autocomplete component quiz passes that admins may record manually."""
+    rank_structure = gatekeeper_settings.get("rank_structure", {}).get(
+        interaction.guild_id, []
+    )
+    normalized_input = current_input.casefold()
+    return [
+        discord.app_commands.Choice(name=quiz["name"], value=quiz["name"])
+        for quiz in rank_structure
+        if is_manually_assignable_quiz(quiz)
+        and normalized_input in quiz["name"].casefold()
     ]
-    
-    # Filter choices by the user's current input
-    possible_choices = [
-        discord.app_commands.Choice(name=rank_name, value=rank_name) 
-        for rank_name in rank_names if current_input.casefold() in rank_name.casefold()
-    ]
-    return possible_choices[:25]
+
 
 async def verify_quiz_settings(quiz_data, quiz_result, member: discord.Member):
     """Ensures a user didn't use cheat settings for the quiz."""
@@ -401,6 +421,7 @@ class LevelUp(commands.Cog):
         self.bot = bot
         self._quiz_menus_refreshed = False
         self._quiz_menu_refresh_lock = asyncio.Lock()
+        self._manual_quiz_grant_lock = asyncio.Lock()
 
     async def cog_load(self):
         await self.bot.RUN(CREATE_QUIZ_ATTEMPTS_TABLE)
@@ -798,35 +819,82 @@ class LevelUp(commands.Cog):
                 f"Cleared quiz cooldown for {user.mention} for `{rank['name']}`."
             )
 
-    @discord.app_commands.command(name="assign_quiz", description="Manually assign a passed quiz to a user.")
+    @discord.app_commands.command(
+        name="assign_quiz",
+        description="Manually assign a component quiz pass to a user.",
+    )
     @discord.app_commands.guild_only()
-    @discord.app_commands.describe(user="The user to reward.", quiz_name="The name of the quiz to assign.")
+    @discord.app_commands.describe(
+        user="The user to reward.",
+        quiz_name="The component quiz pass to assign.",
+    )
     @discord.app_commands.autocomplete(quiz_name=assign_quiz_autocomplete)
     @discord.app_commands.default_permissions(administrator=True)
-    async def assign_quiz(self, interaction: discord.Interaction, user: discord.Member, quiz_name: str):
-        rank_structure = gatekeeper_settings["rank_structure"][interaction.guild.id]
-        quiz_data = find_rank_by_name(rank_structure, quiz_name)
-
-        if quiz_data is None:
-            await interaction.response.send_message("Invalid quiz name.", ephemeral=True)
-            return
-
-        if quiz_data.get("combination_rank"):
+    @discord.app_commands.checks.has_permissions(administrator=True)
+    async def assign_quiz(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        quiz_name: str,
+    ):
+        rank_structure = gatekeeper_settings.get("rank_structure", {}).get(
+            interaction.guild_id
+        )
+        if rank_structure is None:
             await interaction.response.send_message(
-                "Combination ranks cannot be assigned directly. Please assign the required individual quizzes instead.", 
-                ephemeral=True
+                "Quiz grants are not configured for this server.", ephemeral=True
             )
             return
 
-        # Defer response to allow time for API role assignments and DB queries
+        quiz_data = find_rank_by_name(rank_structure, quiz_name)
+
+        if quiz_data is None or not is_manually_assignable_quiz(quiz_data):
+            await interaction.response.send_message(
+                "Only GN1, GN2, and Prima, Divine, or Eternal Idol Vocab "
+                "passes can be assigned manually.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.defer(ephemeral=True)
-        should_announce = await self.reward_user(user, quiz_data)
-        
+        async with self._manual_quiz_grant_lock:
+            earned_ranks = await self.bot.GET(
+                GET_PASSED_QUIZZES, (interaction.guild_id, user.id)
+            )
+            already_has_pass = quiz_data["name"] in {
+                rank[0] for rank in earned_ranks
+            }
+            should_announce = (
+                False
+                if already_has_pass
+                else await self.reward_user(user, quiz_data)
+            )
+
+        if already_has_pass:
+            await interaction.followup.send(
+                f"{user.mention} already has the `{quiz_data['name']}` quiz pass.",
+                ephemeral=True,
+            )
+            return
+
+        _log.info(
+            "Administrator %s (%s) assigned the %s quiz pass to %s (%s) in guild %s",
+            interaction.user,
+            interaction.user.id,
+            quiz_data["name"],
+            user,
+            user.id,
+            interaction.guild_id,
+        )
         if should_announce:
             announce_msg = f"{user.mention} has passed the {quiz_data['name']} quiz!"
             await self.send_in_announcement_channel(user, announce_msg)
 
-        await interaction.followup.send(f"Successfully assigned the `{quiz_data['name']}` quiz to {user.mention}.", ephemeral=True)
+        await interaction.followup.send(
+            f"Successfully assigned the `{quiz_data['name']}` quiz pass to "
+            f"{user.mention}.",
+            ephemeral=True,
+        )
 
     @discord.app_commands.command(name="ranktable", description="Display the distribution of quiz roles in the server.")
     @discord.app_commands.guild_only()
@@ -834,7 +902,7 @@ class LevelUp(commands.Cog):
         rank_structure = gatekeeper_settings["rank_structure"][interaction.guild.id]
         description = build_ranktable_description(interaction.guild, rank_structure)
 
-        embed = discord.Embed(title=f"Role Distribution",
+        embed = discord.Embed(title="Role Distribution",
                               description=description, color=discord.Color.blurple())
         await interaction.response.send_message(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 

@@ -98,9 +98,22 @@ class TMWBot(commands.Bot):
         interaction: discord.Interaction,
         error: discord.app_commands.AppCommandError,
     ):
-        if isinstance(error, discord.app_commands.MissingAnyRole):
+        if isinstance(
+            error,
+            (
+                discord.app_commands.MissingAnyRole,
+                discord.app_commands.MissingPermissions,
+            ),
+        ):
+            command_name = interaction.command.name if interaction.command else "unknown"
+            _log.warning(
+                "User %s (%s) tried to use application command %s without permission",
+                interaction.user,
+                interaction.user.id,
+                command_name,
+            )
             await interaction.response.send_message(
-                "You do not have the permission to use this command.", ephemeral=True
+                "You do not have permission to use this command.", ephemeral=True
             )
             return
         elif isinstance(error, discord.app_commands.CommandOnCooldown):
