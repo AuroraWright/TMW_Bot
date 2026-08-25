@@ -1,6 +1,11 @@
 services:
   tmw-bot:
     image: discord-tmw-bot
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - TOKEN
       - AUTHORIZED_USERS
