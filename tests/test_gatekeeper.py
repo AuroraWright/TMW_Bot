@@ -13,7 +13,6 @@ from cogs.gatekeeper import (
     CREATE_PASSED_QUIZZES_TABLE,
     DELETE_RENAMED_PASSED_QUIZZES,
     GET_PASSED_QUIZZES,
-    MANUALLY_ASSIGNABLE_QUIZ_NAMES,
     RENAME_QUIZ_ATTEMPTS,
     UPSERT_QUIZ_MENU_MESSAGE,
     DynamicQuizMenu,
@@ -22,7 +21,6 @@ from cogs.gatekeeper import (
     build_ranktable_description,
     find_rank_by_name,
     gatekeeper_settings,
-    is_manually_assignable_quiz,
 )
 from lib.bot import TMWBot
 
@@ -269,6 +267,10 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
     guild_id = 1
 
     def setUp(self):
+        self.roles = {
+            10: SimpleNamespace(id=10, name="Student", position=1),
+            20: SimpleNamespace(id=20, name="Prima Idol", position=2),
+        }
         self.rank_structure = [
             {
                 "name": "Student",
@@ -317,7 +319,10 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
         self.user = SimpleNamespace(
             id=100,
             mention="<@100>",
-            guild=SimpleNamespace(id=self.guild_id),
+            guild=SimpleNamespace(
+                id=self.guild_id,
+                get_role=self.roles.get,
+            ),
         )
 
     @staticmethod
@@ -332,7 +337,7 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock()),
         )
 
-    async def invoke(self, quiz_name, *, guild_id=1):
+    async def invoke(self, quiz_name, *, announce=True, guild_id=1):
         interaction = self.make_interaction(guild_id)
         with patch.object(gatekeeper, "gatekeeper_settings", self.settings):
             await LevelUp.assign_quiz.callback(
@@ -340,23 +345,25 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
                 interaction,
                 self.user,
                 quiz_name,
+                announce,
             )
         return interaction
 
-    def test_production_config_exposes_exactly_the_five_component_passes(self):
+    async def test_production_autocomplete_can_find_every_defined_entry(self):
         for guild_id, rank_structure in gatekeeper_settings["rank_structure"].items():
-            with self.subTest(guild_id=guild_id):
-                assignable_names = {
-                    quiz["name"]
-                    for quiz in rank_structure
-                    if is_manually_assignable_quiz(quiz)
-                }
-                self.assertEqual(
-                    assignable_names,
-                    MANUALLY_ASSIGNABLE_QUIZ_NAMES,
-                )
+            interaction = self.make_interaction(guild_id=guild_id)
+            for rank in rank_structure:
+                with self.subTest(guild_id=guild_id, rank_name=rank["name"]):
+                    choices = await assign_quiz_autocomplete(
+                        interaction,
+                        rank["name"],
+                    )
+                    self.assertIn(
+                        rank["name"],
+                        {choice.value for choice in choices},
+                    )
 
-    async def test_autocomplete_only_returns_assignable_matching_passes(self):
+    async def test_autocomplete_returns_all_defined_matching_entries(self):
         interaction = self.make_interaction()
 
         with patch.object(gatekeeper, "gatekeeper_settings", self.settings):
@@ -364,8 +371,8 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
             vocab_choices = await assign_quiz_autocomplete(interaction, "VoCaB")
 
         self.assertEqual(
-            {choice.value for choice in all_choices},
-            MANUALLY_ASSIGNABLE_QUIZ_NAMES,
+            [choice.value for choice in all_choices],
+            [rank["name"] for rank in self.rank_structure],
         )
         self.assertEqual(
             [choice.value for choice in vocab_choices],
@@ -398,19 +405,26 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await command._check_can_run(admin_interaction))
         self.assertTrue(command.default_permissions.administrator)
+        announce_parameter = next(
+            parameter
+            for parameter in command.parameters
+            if parameter.name == "announce"
+        )
+        self.assertEqual(
+            announce_parameter.type,
+            discord.AppCommandOptionType.boolean,
+        )
+        self.assertTrue(announce_parameter.required)
 
-    async def test_role_ranks_combinations_and_arbitrary_input_are_rejected(self):
+    async def test_arbitrary_input_is_rejected(self):
         for quiz_name in (
-            "Student",
-            "Prima Idol",
             "unknown quiz",
             "GN1'); DROP TABLE passed_quizzes; --",
         ):
             with self.subTest(quiz_name=quiz_name):
                 interaction = await self.invoke(quiz_name)
                 interaction.response.send_message.assert_awaited_once_with(
-                    "Only GN1, GN2, and Prima, Divine, or Eternal Idol Vocab "
-                    "passes can be assigned manually.",
+                    "Invalid gatekeeper rank or quiz name.",
                     ephemeral=True,
                 )
                 interaction.response.defer.assert_not_awaited()
@@ -427,8 +441,8 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
         interaction.response.defer.assert_not_awaited()
         self.cog.reward_user.assert_not_awaited()
 
-    async def test_assignable_pass_uses_canonical_name_and_announces(self):
-        interaction = await self.invoke("gn1")
+    async def test_partial_pass_uses_canonical_name_and_announces(self):
+        interaction = await self.invoke("gn1", announce=True)
         quiz_data = find_rank_by_name(self.rank_structure, "GN1")
 
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
@@ -436,33 +450,75 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
             GET_PASSED_QUIZZES,
             (self.guild_id, self.user.id),
         )
-        self.cog.reward_user.assert_awaited_once_with(self.user, quiz_data)
+        self.cog.reward_user.assert_awaited_once_with(
+            self.user,
+            quiz_data,
+            announce_combination_rank=True,
+        )
         self.cog.send_in_announcement_channel.assert_awaited_once_with(
             self.user,
             "<@100> has passed the GN1 quiz!",
         )
         interaction.followup.send.assert_awaited_once_with(
-            "Successfully assigned the `GN1` quiz pass to <@100>.",
+            "Successfully assigned `GN1` to <@100>.",
+            ephemeral=True,
+        )
+
+    async def test_discord_role_rank_can_be_assigned_silently(self):
+        interaction = await self.invoke("Student", announce=False)
+        rank_data = find_rank_by_name(self.rank_structure, "Student")
+
+        self.cog.reward_user.assert_awaited_once_with(
+            self.user,
+            rank_data,
+            announce_combination_rank=False,
+        )
+        self.cog.send_in_announcement_channel.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "Successfully assigned `Student` to <@100>.",
+            ephemeral=True,
+        )
+
+    async def test_combination_rank_can_be_assigned_and_announced(self):
+        interaction = await self.invoke("Prima Idol", announce=True)
+        rank_data = find_rank_by_name(self.rank_structure, "Prima Idol")
+
+        self.cog.reward_user.assert_awaited_once_with(
+            self.user,
+            rank_data,
+            announce_combination_rank=True,
+        )
+        self.cog.send_in_announcement_channel.assert_awaited_once_with(
+            self.user,
+            "<@100> is now a Prima Idol!",
+        )
+        interaction.followup.send.assert_awaited_once_with(
+            "Successfully assigned `Prima Idol` to <@100>.",
             ephemeral=True,
         )
 
     async def test_existing_pass_is_idempotent(self):
         self.bot.GET.return_value = [("GN2",)]
 
-        interaction = await self.invoke("GN2")
+        interaction = await self.invoke("GN2", announce=True)
 
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         self.cog.reward_user.assert_not_awaited()
         self.cog.send_in_announcement_channel.assert_not_awaited()
         interaction.followup.send.assert_awaited_once_with(
-            "<@100> already has the `GN2` quiz pass.",
+            "<@100> already has `GN2` recorded in gatekeeper.",
             ephemeral=True,
         )
 
-    async def test_grant_persists_and_completes_combination_rank_end_to_end(self):
+    async def test_all_rank_types_and_announcement_control_end_to_end(self):
         settings = {
             "rank_structure": {
                 self.guild_id: [
+                    {
+                        "name": "Student",
+                        "combination_rank": False,
+                        "rank_to_get": 10,
+                    },
                     {
                         "name": "GN2",
                         "combination_rank": False,
@@ -483,23 +539,43 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
             },
             "rank_settings": {self.guild_id: {"announce_channel": 30}},
         }
-        role = SimpleNamespace(id=20, name="Prima Idol", position=1)
+        student_role = SimpleNamespace(id=10, name="Student", position=1)
+        prima_role = SimpleNamespace(id=20, name="Prima Idol", position=2)
+        roles = {role.id: role for role in (student_role, prima_role)}
         announcement_channel = SimpleNamespace(send=AsyncMock())
         guild = SimpleNamespace(
             id=self.guild_id,
-            get_role=lambda role_id: role if role_id == role.id else None,
+            get_role=roles.get,
             get_channel=lambda channel_id: (
                 announcement_channel if channel_id == 30 else None
             ),
         )
-        member = SimpleNamespace(
-            id=100,
-            mention="<@100>",
-            guild=guild,
-            roles=[],
-            remove_roles=AsyncMock(),
-            add_roles=AsyncMock(),
-        )
+
+        def make_member(member_id):
+            member = SimpleNamespace(
+                id=member_id,
+                mention=f"<@{member_id}>",
+                guild=guild,
+                roles=[],
+            )
+
+            async def remove_roles(*roles_to_remove):
+                member.roles = [
+                    role
+                    for role in member.roles
+                    if role not in roles_to_remove
+                ]
+
+            async def add_role(role):
+                if role not in member.roles:
+                    member.roles.append(role)
+
+            member.remove_roles = AsyncMock(side_effect=remove_roles)
+            member.add_roles = AsyncMock(side_effect=add_role)
+            return member
+
+        silent_member = make_member(100)
+        announced_member = make_member(101)
 
         with tempfile.TemporaryDirectory() as directory:
             bot = TMWBot(
@@ -512,6 +588,13 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
                 cog = LevelUp(bot)
 
                 with patch.object(gatekeeper, "gatekeeper_settings", settings):
+                    await LevelUp.assign_quiz.callback(
+                        cog,
+                        self.make_interaction(),
+                        silent_member,
+                        "Student",
+                        False,
+                    )
                     concurrent_gn2_interactions = [
                         self.make_interaction(),
                         self.make_interaction(),
@@ -521,8 +604,9 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
                             LevelUp.assign_quiz.callback(
                                 cog,
                                 interaction,
-                                member,
+                                silent_member,
                                 "GN2",
+                                False,
                             )
                             for interaction in concurrent_gn2_interactions
                         )
@@ -530,32 +614,66 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
                     await LevelUp.assign_quiz.callback(
                         cog,
                         self.make_interaction(),
-                        member,
+                        silent_member,
                         "Prima Idol Vocab",
+                        False,
                     )
 
                     duplicate_interaction = self.make_interaction()
                     await LevelUp.assign_quiz.callback(
                         cog,
                         duplicate_interaction,
-                        member,
+                        silent_member,
                         "Prima Idol Vocab",
+                        False,
                     )
 
-                recorded_quizzes = await bot.GET(
+                    for quiz_name in ("GN2", "Prima Idol Vocab"):
+                        await LevelUp.assign_quiz.callback(
+                            cog,
+                            self.make_interaction(),
+                            announced_member,
+                            quiz_name,
+                            True,
+                        )
+
+                silent_quizzes = await bot.GET(
                     GET_PASSED_QUIZZES,
-                    (self.guild_id, member.id),
+                    (self.guild_id, silent_member.id),
+                )
+                announced_quizzes = await bot.GET(
+                    GET_PASSED_QUIZZES,
+                    (self.guild_id, announced_member.id),
                 )
             finally:
                 await bot.close()
 
         self.assertEqual(
-            {row[0] for row in recorded_quizzes},
+            {row[0] for row in silent_quizzes},
+            {"Student", "GN2", "Prima Idol Vocab", "Prima Idol"},
+        )
+        self.assertEqual(
+            {row[0] for row in announced_quizzes},
             {"GN2", "Prima Idol Vocab", "Prima Idol"},
         )
-        member.remove_roles.assert_awaited_once_with(role)
-        member.add_roles.assert_awaited_once_with(role)
-        self.assertEqual(announcement_channel.send.await_count, 3)
+        self.assertEqual(silent_member.roles, [prima_role])
+        self.assertEqual(announced_member.roles, [prima_role])
+        self.assertEqual(
+            silent_member.add_roles.await_args_list,
+            [call(student_role), call(prima_role)],
+        )
+        self.assertEqual(
+            announced_member.add_roles.await_args_list,
+            [call(prima_role)],
+        )
+        self.assertEqual(
+            announcement_channel.send.await_args_list,
+            [
+                call("<@101> has passed the GN2 quiz!"),
+                call("<@101> is now a Prima Idol!"),
+                call("<@101> has passed the Prima Idol Vocab quiz!"),
+            ],
+        )
         concurrent_messages = {
             interaction.followup.send.await_args.args[0]
             for interaction in concurrent_gn2_interactions
@@ -563,12 +681,12 @@ class ManualQuizGrantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             concurrent_messages,
             {
-                "Successfully assigned the `GN2` quiz pass to <@100>.",
-                "<@100> already has the `GN2` quiz pass.",
+                "Successfully assigned `GN2` to <@100>.",
+                "<@100> already has `GN2` recorded in gatekeeper.",
             },
         )
         duplicate_interaction.followup.send.assert_awaited_once_with(
-            "<@100> already has the `Prima Idol Vocab` quiz pass.",
+            "<@100> already has `Prima Idol Vocab` recorded in gatekeeper.",
             ephemeral=True,
         )
 

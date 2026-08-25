@@ -94,16 +94,6 @@ UPSERT_QUIZ_MENU_MESSAGE = """INSERT INTO quiz_menu_messages
 DELETE_QUIZ_MENU_MESSAGE = """DELETE FROM quiz_menu_messages
                              WHERE guild_id = ?;"""
 
-MANUALLY_ASSIGNABLE_QUIZ_NAMES = frozenset(
-    {
-        "GN1",
-        "GN2",
-        "Prima Idol Vocab",
-        "Divine Idol Vocab",
-        "Eternal Idol Vocab",
-    }
-)
-
 
 def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
     if rank_name is None:
@@ -115,15 +105,6 @@ def find_rank_by_name(rank_structure: list[dict], rank_name: str | None):
         if any(name.casefold() == normalized_name for name in accepted_names):
             return rank
     return None
-
-
-def is_manually_assignable_quiz(quiz_data: dict) -> bool:
-    """Return whether admins may manually record this component quiz pass."""
-    return (
-        quiz_data["name"] in MANUALLY_ASSIGNABLE_QUIZ_NAMES
-        and not quiz_data.get("combination_rank", False)
-        and quiz_data.get("rank_to_get") is None
-    )
 
 
 def build_ranktable_description(guild: discord.Guild, rank_structure: list[dict]):
@@ -174,17 +155,17 @@ async def quiz_autocomplete(interaction: discord.Interaction, current_input: str
 
 
 async def assign_quiz_autocomplete(interaction: discord.Interaction, current_input: str):
-    """Autocomplete component quiz passes that admins may record manually."""
+    """Autocomplete gatekeeper ranks and quiz passes for manual assignment."""
     rank_structure = gatekeeper_settings.get("rank_structure", {}).get(
         interaction.guild_id, []
     )
     normalized_input = current_input.casefold()
-    return [
+    choices = [
         discord.app_commands.Choice(name=quiz["name"], value=quiz["name"])
         for quiz in rank_structure
-        if is_manually_assignable_quiz(quiz)
-        and normalized_input in quiz["name"].casefold()
+        if normalized_input in quiz["name"].casefold()
     ]
+    return choices[:25]
 
 
 async def verify_quiz_settings(quiz_data, quiz_result, member: discord.Member):
@@ -649,7 +630,13 @@ class LevelUp(commands.Cog):
         rank_structure = gatekeeper_settings["rank_structure"][guild.id]
         return [guild.get_role(role["rank_to_get"]) for role in rank_structure if role["rank_to_get"]]
 
-    async def reward_user(self, member: discord.Member, quiz_data: dict):
+    async def reward_user(
+        self,
+        member: discord.Member,
+        quiz_data: dict,
+        *,
+        announce_combination_rank: bool = True,
+    ):
         await self.bot.RUN(ADD_PASSED_QUIZ, (member.guild.id, member.id, quiz_data["name"]))
         if quiz_data["rank_to_get"]:
             roles = [role for role in await self.get_all_quiz_roles(member.guild) if role is not None]
@@ -658,9 +645,17 @@ class LevelUp(commands.Cog):
             await member.add_roles(role_to_get)
             return True
         else:
-            return await self.check_if_combination_rank_earned(member)
+            return await self.check_if_combination_rank_earned(
+                member,
+                announce=announce_combination_rank,
+            )
 
-    async def check_if_combination_rank_earned(self, member: discord.Member):
+    async def check_if_combination_rank_earned(
+        self,
+        member: discord.Member,
+        *,
+        announce: bool = True,
+    ):
         rank_structure = gatekeeper_settings["rank_structure"][member.guild.id]
         combination_ranks = [
             rank_data for rank_data in rank_structure if rank_data["combination_rank"] is True]
@@ -672,9 +667,17 @@ class LevelUp(commands.Cog):
                 return False
 
             if all(quiz_name in earned_ranks for quiz_name in rank["quizzes_required"]):
-                await self.reward_user(member, rank)
-                role_to_get = member.guild.get_role(rank["rank_to_get"])
-                await self.send_in_announcement_channel(member, f"{member.mention} is now a {role_to_get.name}!")
+                await self.reward_user(
+                    member,
+                    rank,
+                    announce_combination_rank=announce,
+                )
+                if announce:
+                    role_to_get = member.guild.get_role(rank["rank_to_get"])
+                    await self.send_in_announcement_channel(
+                        member,
+                        f"{member.mention} is now a {role_to_get.name}!",
+                    )
                 return True
         return True
 
@@ -821,12 +824,13 @@ class LevelUp(commands.Cog):
 
     @discord.app_commands.command(
         name="assign_quiz",
-        description="Manually assign a component quiz pass to a user.",
+        description="Manually assign a gatekeeper rank or quiz pass to a user.",
     )
     @discord.app_commands.guild_only()
     @discord.app_commands.describe(
         user="The user to reward.",
-        quiz_name="The component quiz pass to assign.",
+        quiz_name="The gatekeeper rank or quiz pass to assign.",
+        announce="Whether to announce this grant in the announcement channel.",
     )
     @discord.app_commands.autocomplete(quiz_name=assign_quiz_autocomplete)
     @discord.app_commands.default_permissions(administrator=True)
@@ -836,6 +840,7 @@ class LevelUp(commands.Cog):
         interaction: discord.Interaction,
         user: discord.Member,
         quiz_name: str,
+        announce: bool,
     ):
         rank_structure = gatekeeper_settings.get("rank_structure", {}).get(
             interaction.guild_id
@@ -848,10 +853,9 @@ class LevelUp(commands.Cog):
 
         quiz_data = find_rank_by_name(rank_structure, quiz_name)
 
-        if quiz_data is None or not is_manually_assignable_quiz(quiz_data):
+        if quiz_data is None:
             await interaction.response.send_message(
-                "Only GN1, GN2, and Prima, Divine, or Eternal Idol Vocab "
-                "passes can be assigned manually.",
+                "Invalid gatekeeper rank or quiz name.",
                 ephemeral=True,
             )
             return
@@ -867,32 +871,45 @@ class LevelUp(commands.Cog):
             should_announce = (
                 False
                 if already_has_pass
-                else await self.reward_user(user, quiz_data)
+                else await self.reward_user(
+                    user,
+                    quiz_data,
+                    announce_combination_rank=announce,
+                )
             )
 
         if already_has_pass:
             await interaction.followup.send(
-                f"{user.mention} already has the `{quiz_data['name']}` quiz pass.",
+                f"{user.mention} already has `{quiz_data['name']}` recorded in "
+                "gatekeeper.",
                 ephemeral=True,
             )
             return
 
         _log.info(
-            "Administrator %s (%s) assigned the %s quiz pass to %s (%s) in guild %s",
+            "Administrator %s (%s) assigned %s to %s (%s) in guild %s "
+            "with announcement=%s",
             interaction.user,
             interaction.user.id,
             quiz_data["name"],
             user,
             user.id,
             interaction.guild_id,
+            announce,
         )
-        if should_announce:
-            announce_msg = f"{user.mention} has passed the {quiz_data['name']} quiz!"
+        if announce and should_announce:
+            if quiz_data.get("combination_rank"):
+                role_to_get = user.guild.get_role(quiz_data["rank_to_get"])
+                role_name = role_to_get.name if role_to_get else quiz_data["name"]
+                announce_msg = f"{user.mention} is now a {role_name}!"
+            else:
+                announce_msg = (
+                    f"{user.mention} has passed the {quiz_data['name']} quiz!"
+                )
             await self.send_in_announcement_channel(user, announce_msg)
 
         await interaction.followup.send(
-            f"Successfully assigned the `{quiz_data['name']}` quiz pass to "
-            f"{user.mention}.",
+            f"Successfully assigned `{quiz_data['name']}` to {user.mention}.",
             ephemeral=True,
         )
 

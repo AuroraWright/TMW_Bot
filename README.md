@@ -73,7 +73,7 @@ Works with Kotoba bot quizzes to verify and award roles based on quiz performanc
 
 Commands:
 * `/reset_user_cooldown` `<user>` `<quiz_to_reset>` - Admin only. Reset a user's quiz cooldown. Optional quiz parameter to reset specific quiz.
-* `/assign_quiz` `<user>` `<quiz_name>` - Admin only. Manually record a GN1, GN2, Prima Idol Vocab, Divine Idol Vocab, or Eternal Idol Vocab pass for a user.
+* `/assign_quiz` `<user>` `<quiz_name>` `<announce>` - Admin only. Manually assign any configured gatekeeper rank or quiz pass. Set `announce` to false to suppress both quiz-pass and resulting combination-rank announcements.
 * `/ranktable` - Display the distribution of quiz roles in the server, showing percentage of users with each role and configured rank-group headings.
 * `/rankusers` `<role>` - See all users with a specific role.
 * `/list_role_commands` `<guild_id>` - List all quiz commands and their corresponding reward roles. Guild ID is optional.
