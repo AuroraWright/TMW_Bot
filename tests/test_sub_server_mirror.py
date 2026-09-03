@@ -259,6 +259,29 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_role_moves_never_include_the_bot_managed_role(self):
+        movable = Mock(id=20, position=2, managed=False)
+        movable.is_assignable.return_value = True
+        bot_role = Mock(id=21, position=4, managed=True)
+        bot_role.is_assignable.return_value = False
+        destination = SimpleNamespace(
+            get_role=Mock(
+                side_effect=lambda role_id: movable if role_id == 20 else bot_role
+            ),
+            edit_role_positions=AsyncMock(),
+            me=SimpleNamespace(top_role=bot_role),
+        )
+
+        await self.cog._apply_mirrored_role_positions(
+            destination,
+            {movable: 1, bot_role: 3},
+        )
+
+        destination.edit_role_positions.assert_awaited_once_with(
+            positions={movable: 1},
+            reason=MIRROR_REASON,
+        )
+
     async def test_channel_positions_use_relative_order_and_are_idempotent(self):
         source_first = SimpleNamespace(id=10, position=4, category_id=None)
         source_second = SimpleNamespace(id=11, position=19, category_id=None)

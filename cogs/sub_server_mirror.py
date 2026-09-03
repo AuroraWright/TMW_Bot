@@ -453,6 +453,43 @@ class SubServerMirror(commands.Cog):
             if role.position != position
         }
 
+    async def _apply_mirrored_role_positions(
+        self,
+        destination_guild: discord.Guild,
+        positions: Mapping[discord.Role, int],
+    ) -> None:
+        """Move roles individually so managed roles never enter the API payload."""
+        for destination_role, position in positions.items():
+            current_role = destination_guild.get_role(destination_role.id)
+            if current_role is None:
+                continue
+            if current_role.position == position:
+                continue
+            if current_role.managed or not current_role.is_assignable():
+                _log.warning(
+                    "Cannot move mirrored role %s to position %s because it is not below the bot's highest role.",
+                    current_role.id,
+                    position,
+                )
+                continue
+            try:
+                await destination_guild.edit_role_positions(
+                    positions={current_role: position},
+                    reason=MIRROR_REASON,
+                )
+                await self._mutation_pause()
+            except (discord.Forbidden, discord.HTTPException) as error:
+                bot_top_role = getattr(destination_guild.me, "top_role", None)
+                _log.error(
+                    "Failed to move mirrored role %s from position %s to %s (bot top role %s at position %s): %s",
+                    current_role.id,
+                    current_role.position,
+                    position,
+                    getattr(bot_top_role, "id", None),
+                    getattr(bot_top_role, "position", None),
+                    error,
+                )
+
     async def _sync_roles(
         self,
         source_guild: discord.Guild,
@@ -567,18 +604,7 @@ class SubServerMirror(commands.Cog):
 
         positions = self._mirrored_role_positions(source_roles, role_map)
         if positions:
-            try:
-                await destination_guild.edit_role_positions(
-                    positions=positions,
-                    reason=MIRROR_REASON,
-                )
-                await self._mutation_pause()
-            except (discord.Forbidden, discord.HTTPException) as error:
-                _log.error(
-                    "Failed to mirror role positions in %s: %s",
-                    destination_guild.id,
-                    error,
-                )
+            await self._apply_mirrored_role_positions(destination_guild, positions)
 
         return role_map
 
