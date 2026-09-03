@@ -19,4 +19,6 @@ mirror:
   delete_unmapped_channels: true
   delete_unmapped_emojis: true
   mirror_guild_settings: true
+  # Keep each backup server's locally chosen name.
+  mirror_guild_name: false
   mirror_member_roles: true

@@ -59,6 +59,7 @@ class MirrorSettings:
     delete_unmapped_channels: bool = False
     delete_unmapped_emojis: bool = False
     mirror_guild_settings: bool = True
+    mirror_guild_name: bool = True
     mirror_member_roles: bool = True
 
     @classmethod
@@ -78,6 +79,7 @@ class MirrorSettings:
             "delete_unmapped_channels",
             "delete_unmapped_emojis",
             "mirror_guild_settings",
+            "mirror_guild_name",
             "mirror_member_roles",
         }
         for field in boolean_fields:
@@ -1428,13 +1430,14 @@ class SubServerMirror(commands.Cog):
             return
         kwargs: dict[str, Any] = {}
         comparable = {
-            "name": source_guild.name,
             "verification_level": source_guild.verification_level,
             "default_notifications": source_guild.default_notifications,
             "explicit_content_filter": source_guild.explicit_content_filter,
             "afk_timeout": source_guild.afk_timeout,
             "system_channel_flags": source_guild.system_channel_flags,
         }
+        if self.settings.mirror_guild_name:
+            comparable["name"] = source_guild.name
         if "COMMUNITY" in destination_guild.features:
             comparable["verification_level"] = max(
                 comparable["verification_level"],

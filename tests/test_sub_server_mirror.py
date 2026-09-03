@@ -63,6 +63,7 @@ class MirrorSettingsTests(unittest.TestCase):
         self.assertTrue(config["mirror"]["delete_unmapped_channels"])
         self.assertTrue(config["mirror"]["delete_unmapped_emojis"])
         self.assertEqual(config["mirror"]["emoji_creations_per_reconcile"], 5)
+        self.assertFalse(config["mirror"]["mirror_guild_name"])
 
     def test_mirror_settings_validate_types_and_intervals(self):
         settings = MirrorSettings.from_mapping(
@@ -83,6 +84,8 @@ class MirrorSettingsTests(unittest.TestCase):
             MirrorSettings.from_mapping({"reconcile_interval_minutes": 0})
         with self.assertRaises(TypeError):
             MirrorSettings.from_mapping({"emoji_creations_per_reconcile": 1.5})
+        with self.assertRaises(TypeError):
+            MirrorSettings.from_mapping({"mirror_guild_name": "no"})
 
     def test_production_guild_ids_are_not_hardcoded_in_python(self):
         source = "\n".join(
@@ -429,6 +432,35 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             explicit_content_filter=discord.ContentFilter.all_members,
             reason=MIRROR_REASON,
         )
+
+    async def test_guild_name_can_remain_destination_managed(self):
+        self.cog.settings = MirrorSettings(
+            enabled=True,
+            mirror_guild_settings=True,
+            mirror_guild_name=False,
+            mutation_delay_seconds=0,
+        )
+        shared = {
+            "features": [],
+            "verification_level": discord.VerificationLevel.none,
+            "default_notifications": discord.NotificationLevel.all_messages,
+            "explicit_content_filter": discord.ContentFilter.disabled,
+            "afk_timeout": 300,
+            "system_channel_flags": SimpleNamespace(value=0),
+            "icon": None,
+            "afk_channel": None,
+            "system_channel": None,
+        }
+        source = SimpleNamespace(name="Main server", **shared)
+        destination = SimpleNamespace(
+            name="My custom backup name",
+            edit=AsyncMock(),
+            **shared,
+        )
+
+        await self.cog._sync_guild_settings(source, destination, {})
+
+        destination.edit.assert_not_awaited()
 
     def test_optional_role_style_falls_back_to_base_colour(self):
         kwargs = {

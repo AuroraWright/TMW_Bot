@@ -193,7 +193,7 @@ No user commands - fully automatic. Server IDs are defined in `config/sub_server
 
 #### `sub_server_mirror.py`
 
-Maintains a one-way structural mirror from the configured main guild to its sub-server destinations. It copies regular role properties and order, channel/category layout and permission overwrites, supported guild settings, member roles, and as many static and animated emojis as the destination's current slots permit. Persisted ID mappings make startup reconciliation resumable and prevent duplicates. Periodic reconciliation fills newly available emoji slots later.
+Maintains a one-way structural mirror from the configured main guild to its sub-server destinations. It copies regular role properties and order, channel/category layout and permission overwrites, supported guild settings, member roles, and as many static and animated emojis as the destination's current slots permit. The destination server name can remain locally managed by disabling `mirror_guild_name` in `config/sub_server_settings.yml`. Persisted ID mappings make startup reconciliation resumable and prevent duplicates. Periodic reconciliation fills newly available emoji slots later.
 
 The main guild is always read-only. Mirror destinations are authoritative only for Discord-assigned destination IDs; their role or layout edits are replaced from the main guild and never flow back into role restoration. For full fidelity, the bot needs Administrator in the destination and enough role hierarchy to manage every copied role. It only needs read access, Server Members, and Ban Members in the main guild.
 
