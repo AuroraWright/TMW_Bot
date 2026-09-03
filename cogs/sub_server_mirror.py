@@ -54,6 +54,7 @@ class MirrorSettings:
     event_debounce_seconds: float = 10.0
     mutation_delay_seconds: float = 0.5
     emoji_create_delay_seconds: float = 5.0
+    emoji_creations_per_reconcile: int = 5
     delete_unmapped_roles: bool = False
     delete_unmapped_channels: bool = False
     delete_unmapped_emojis: bool = False
@@ -97,6 +98,14 @@ class MirrorSettings:
             if values[field] < 0:
                 raise ValueError(f"mirror.{field} cannot be negative.")
 
+        batch_size = values["emoji_creations_per_reconcile"]
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError(
+                "mirror.emoji_creations_per_reconcile must be a whole number."
+            )
+        if batch_size < 0:
+            raise ValueError("mirror.emoji_creations_per_reconcile cannot be negative.")
+
         if values["reconcile_interval_minutes"] == 0:
             raise ValueError(
                 "mirror.reconcile_interval_minutes must be greater than zero."
@@ -129,6 +138,7 @@ class SubServerMirror(commands.Cog):
         self._mirror_lock = asyncio.Lock()
         self._debounced_reconcile: asyncio.Task | None = None
         self._reconcile_requested = False
+        self._active_destination_ids: set[int] = set()
         self._member_sync_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._member_sync_requested: set[tuple[int, int]] = set()
 
@@ -285,6 +295,17 @@ class SubServerMirror(commands.Cog):
             _log.warning("Could not read display icon for role %s: %s", role.id, error)
             return None
 
+    @staticmethod
+    def _without_optional_role_style(
+        kwargs: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Drop role styling gated by destination guild features."""
+        fallback = dict(kwargs)
+        removed_style = False
+        for name in ("display_icon", "secondary_colour", "tertiary_colour"):
+            removed_style = fallback.pop(name, None) is not None or removed_style
+        return fallback if removed_style else None
+
     async def _create_role(
         self,
         destination_guild: discord.Guild,
@@ -307,22 +328,40 @@ class SubServerMirror(commands.Cog):
         try:
             role = await destination_guild.create_role(**kwargs)
         except discord.Forbidden as error:
-            _log.error("Failed to create mirrored role %s: %s", source_role.id, error)
-            return None
-        except discord.HTTPException as error:
-            if "display_icon" not in kwargs:
+            fallback = self._without_optional_role_style(kwargs)
+            if fallback is None:
                 _log.error(
                     "Failed to create mirrored role %s: %s", source_role.id, error
                 )
                 return None
             _log.warning(
-                "Role icon for %s could not be mirrored; retrying without it: %s",
+                "Optional styling for role %s is unavailable in the sub-server; retrying with its base colour: %s",
                 source_role.id,
                 error,
             )
-            kwargs.pop("display_icon")
             try:
-                role = await destination_guild.create_role(**kwargs)
+                role = await destination_guild.create_role(**fallback)
+            except (discord.Forbidden, discord.HTTPException) as retry_error:
+                _log.error(
+                    "Failed to create mirrored role %s: %s",
+                    source_role.id,
+                    retry_error,
+                )
+                return None
+        except discord.HTTPException as error:
+            fallback = self._without_optional_role_style(kwargs)
+            if fallback is None:
+                _log.error(
+                    "Failed to create mirrored role %s: %s", source_role.id, error
+                )
+                return None
+            _log.warning(
+                "Optional styling for role %s is unavailable in the sub-server; retrying with its base colour: %s",
+                source_role.id,
+                error,
+            )
+            try:
+                role = await destination_guild.create_role(**fallback)
             except (discord.Forbidden, discord.HTTPException) as retry_error:
                 _log.error(
                     "Failed to create mirrored role %s: %s",
@@ -360,8 +399,26 @@ class SubServerMirror(commands.Cog):
         try:
             updated = await destination_role.edit(**kwargs)
         except (discord.Forbidden, discord.HTTPException) as error:
-            _log.error("Failed to update mirrored role %s: %s", source_role.id, error)
-            return destination_role
+            fallback = self._without_optional_role_style(kwargs)
+            if fallback is None:
+                _log.error(
+                    "Failed to update mirrored role %s: %s", source_role.id, error
+                )
+                return destination_role
+            _log.warning(
+                "Optional styling for role %s is unavailable in the sub-server; retrying with its base colour: %s",
+                source_role.id,
+                error,
+            )
+            try:
+                updated = await destination_role.edit(**fallback)
+            except (discord.Forbidden, discord.HTTPException) as retry_error:
+                _log.error(
+                    "Failed to update mirrored role %s: %s",
+                    source_role.id,
+                    retry_error,
+                )
+                return destination_role
         await self._mutation_pause()
         return updated or destination_role
 
@@ -648,8 +705,18 @@ class SubServerMirror(commands.Cog):
         animated_count = sum(emoji.animated for emoji in retained_emojis)
         limit = destination_guild.emoji_limit
         full_slot_types: set[str] = set()
+        created_count = 0
+        batch_limit_logged = False
 
         for source_emoji, desired_roles in missing_source_emojis:
+            if created_count >= self.settings.emoji_creations_per_reconcile:
+                if not batch_limit_logged:
+                    _log.info(
+                        "Emoji creation batch limit reached in sub-server %s; remaining emojis will be resumed by a later reconciliation.",
+                        destination_guild.id,
+                    )
+                    batch_limit_logged = True
+                continue
             current_count = animated_count if source_emoji.animated else static_count
             if current_count >= limit:
                 slot_type = "animated" if source_emoji.animated else "static"
@@ -677,6 +744,7 @@ class SubServerMirror(commands.Cog):
                 animated_count += 1
             else:
                 static_count += 1
+            created_count += 1
             emoji_map[source_emoji.id] = destination_emoji
             used_destination_ids.add(destination_emoji.id)
             await self._save_entity_mapping(
@@ -688,6 +756,17 @@ class SubServerMirror(commands.Cog):
             await self._mutation_pause(self.settings.emoji_create_delay_seconds)
 
         return emoji_map
+
+    async def _existing_emoji_map(
+        self,
+        destination_guild: discord.Guild,
+    ) -> dict[int, discord.Emoji]:
+        mapping_ids = await self._load_entity_map(destination_guild.id, "emoji")
+        return {
+            source_id: emoji
+            for source_id, destination_id in mapping_ids.items()
+            if (emoji := destination_guild.get_emoji(destination_id)) is not None
+        }
 
     @staticmethod
     def _translate_emoji(
@@ -883,8 +962,6 @@ class SubServerMirror(commands.Cog):
     ) -> bool:
         if source_channel.name != destination_channel.name:
             return True
-        if source_channel.position != destination_channel.position:
-            return True
         if self._overwrite_signature(overwrites) != self._overwrite_signature(
             destination_channel.overwrites
         ):
@@ -981,7 +1058,6 @@ class SubServerMirror(commands.Cog):
         kind = self._channel_kind(source_channel)
         kwargs: dict[str, Any] = {
             "name": source_channel.name,
-            "position": source_channel.position,
             "overwrites": overwrites,
             "reason": MIRROR_REASON,
         }
@@ -1042,6 +1118,71 @@ class SubServerMirror(commands.Cog):
             return destination_channel
         await self._mutation_pause()
         return updated or destination_channel
+
+    @staticmethod
+    def _channel_order_key(
+        channel: discord.abc.GuildChannel,
+    ) -> tuple[int, int]:
+        return (channel.position, channel.id)
+
+    async def _sync_channel_positions(
+        self,
+        source_channels: list[discord.abc.GuildChannel],
+        destination_guild: discord.Guild,
+        channel_map: Mapping[int, discord.abc.GuildChannel],
+    ) -> None:
+        """Preserve relative channel order without copying absolute positions."""
+        grouped: dict[
+            tuple[int | None, int],
+            list[discord.abc.GuildChannel],
+        ] = {}
+        for source_channel in sorted(source_channels, key=self._channel_order_key):
+            destination_channel = channel_map.get(source_channel.id)
+            if destination_channel is None:
+                continue
+            source_category_id = getattr(source_channel, "category_id", None)
+            destination_category = (
+                channel_map.get(source_category_id)
+                if source_category_id is not None
+                else None
+            )
+            destination_category_id = getattr(destination_category, "id", None)
+            sorting_bucket = getattr(
+                destination_channel,
+                "_sorting_bucket",
+                destination_channel.type.value,
+            )
+            grouped.setdefault((destination_category_id, sorting_bucket), []).append(
+                destination_channel
+            )
+
+        payload: list[dict[str, int]] = []
+        for channels in grouped.values():
+            if all(
+                channel.position == position
+                for position, channel in enumerate(channels)
+            ):
+                continue
+            payload.extend(
+                {"id": channel.id, "position": position}
+                for position, channel in enumerate(channels)
+            )
+
+        if not payload:
+            return
+        try:
+            await destination_guild._state.http.bulk_channel_update(
+                destination_guild.id,
+                payload,
+                reason=MIRROR_REASON,
+            )
+            await self._mutation_pause()
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.error(
+                "Failed to mirror channel positions in %s: %s",
+                destination_guild.id,
+                error,
+            )
 
     async def _sync_channels(
         self,
@@ -1180,6 +1321,12 @@ class SubServerMirror(commands.Cog):
                         error,
                     )
 
+        await self._sync_channel_positions(
+            source_channels,
+            destination_guild,
+            channel_map,
+        )
+
         return channel_map
 
     async def _ensure_destination_community(
@@ -1212,10 +1359,20 @@ class SubServerMirror(commands.Cog):
             return destination_guild, False
 
         try:
+            verification_level = max(
+                source_guild.verification_level,
+                discord.VerificationLevel.low,
+            )
+            content_filter = max(
+                source_guild.explicit_content_filter,
+                discord.ContentFilter.all_members,
+            )
             await destination_guild.edit(
                 community=True,
                 rules_channel=rules_channel,
                 public_updates_channel=updates_channel,
+                verification_level=verification_level,
+                explicit_content_filter=content_filter,
                 reason=MIRROR_REASON,
             )
             await self._mutation_pause()
@@ -1253,6 +1410,14 @@ class SubServerMirror(commands.Cog):
             "system_channel_flags": source_guild.system_channel_flags,
         }
         if "COMMUNITY" in destination_guild.features:
+            comparable["verification_level"] = max(
+                comparable["verification_level"],
+                discord.VerificationLevel.low,
+            )
+            comparable["explicit_content_filter"] = max(
+                comparable["explicit_content_filter"],
+                discord.ContentFilter.all_members,
+            )
             comparable.update(
                 description=source_guild.description,
                 preferred_locale=source_guild.preferred_locale,
@@ -1429,12 +1594,7 @@ class SubServerMirror(commands.Cog):
             destination_guild.id,
             max(len(role_map) - 1, 0),
         )
-        emoji_map = await self._sync_emojis(source_guild, destination_guild, role_map)
-        _log.info(
-            "Emoji mirror phase completed for sub-server %s (%s emojis mapped; slot-limited emojis will retry later).",
-            destination_guild.id,
-            len(emoji_map),
-        )
+        existing_emoji_map = await self._existing_emoji_map(destination_guild)
         _log.info(
             "Starting channel mirror phase for sub-server %s.",
             destination_guild.id,
@@ -1443,7 +1603,7 @@ class SubServerMirror(commands.Cog):
             source_guild,
             destination_guild,
             role_map,
-            emoji_map,
+            existing_emoji_map,
         )
         _log.info(
             "Channel mirror phase completed for sub-server %s (%s channels mapped).",
@@ -1458,10 +1618,29 @@ class SubServerMirror(commands.Cog):
                 source_guild,
                 destination_guild,
                 role_map,
-                emoji_map,
+                existing_emoji_map,
             )
         await self._sync_guild_settings(source_guild, destination_guild, channel_map)
         await self._sync_all_member_roles(source_guild, destination_guild, role_map)
+        _log.info(
+            "Core guild mirror completed for sub-server %s; starting resumable emoji phase.",
+            destination_guild.id,
+        )
+        emoji_map = await self._sync_emojis(source_guild, destination_guild, role_map)
+        if {source_id: emoji.id for source_id, emoji in emoji_map.items()} != {
+            source_id: emoji.id for source_id, emoji in existing_emoji_map.items()
+        }:
+            channel_map = await self._sync_channels(
+                source_guild,
+                destination_guild,
+                role_map,
+                emoji_map,
+            )
+        _log.info(
+            "Emoji mirror phase completed for sub-server %s (%s emojis mapped; pending emojis will retry later).",
+            destination_guild.id,
+            len(emoji_map),
+        )
         _log.info(
             "Completed one-way guild mirror reconciliation from %s to %s.",
             source_guild.id,
@@ -1480,6 +1659,7 @@ class SubServerMirror(commands.Cog):
                 )
                 return
             for destination_guild in self._get_sub_guilds():
+                self._active_destination_ids.add(destination_guild.id)
                 try:
                     await self._reconcile_guild(source_guild, destination_guild)
                 except Exception:  # noqa: BLE001 - keep the recurring sync alive
@@ -1488,6 +1668,8 @@ class SubServerMirror(commands.Cog):
                         source_guild.id,
                         destination_guild.id,
                     )
+                finally:
+                    self._active_destination_ids.discard(destination_guild.id)
 
     async def sync_member_roles(self, destination_member: discord.Member) -> None:
         if not self.settings.enabled or not self.settings.mirror_member_roles:
@@ -1528,8 +1710,10 @@ class SubServerMirror(commands.Cog):
                 source_member, destination_member, channel_map
             )
 
-    def _schedule_reconcile(self) -> None:
+    def _schedule_reconcile(self, event_guild_id: int | None = None) -> None:
         if not self.settings.enabled:
+            return
+        if event_guild_id in self._active_destination_ids:
             return
         if (
             self._debounced_reconcile is not None
@@ -1595,36 +1779,36 @@ class SubServerMirror(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild) -> None:
         if self._is_mirrored_guild_id(guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(guild.id)
 
     @commands.Cog.listener()
     async def on_guild_update(
         self, before: discord.Guild, after: discord.Guild
     ) -> None:
         if self._is_mirrored_guild_id(after.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(after.id)
 
     @commands.Cog.listener()
     async def on_guild_role_create(self, role: discord.Role) -> None:
         if self._is_mirrored_guild_id(role.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(role.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_role_update(
         self, before: discord.Role, after: discord.Role
     ) -> None:
         if self._is_mirrored_guild_id(after.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(after.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_role_delete(self, role: discord.Role) -> None:
         if self._is_mirrored_guild_id(role.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(role.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_channel_create(self, channel: discord.abc.GuildChannel) -> None:
         if self._is_mirrored_guild_id(channel.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(channel.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_channel_update(
@@ -1633,12 +1817,12 @@ class SubServerMirror(commands.Cog):
         after: discord.abc.GuildChannel,
     ) -> None:
         if self._is_mirrored_guild_id(after.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(after.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         if self._is_mirrored_guild_id(channel.guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(channel.guild.id)
 
     @commands.Cog.listener()
     async def on_guild_emojis_update(
@@ -1648,7 +1832,7 @@ class SubServerMirror(commands.Cog):
         after: tuple[discord.Emoji, ...],
     ) -> None:
         if self._is_mirrored_guild_id(guild.id):
-            self._schedule_reconcile()
+            self._schedule_reconcile(guild.id)
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:

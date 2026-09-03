@@ -12,6 +12,9 @@ mirror:
   event_debounce_seconds: 10
   mutation_delay_seconds: 0.5
   emoji_create_delay_seconds: 5
+  # Emoji endpoints have unusually strict hidden per-guild limits. Keep each
+  # pass small; the 30-minute reconciliation resumes whatever remains.
+  emoji_creations_per_reconcile: 5
   delete_unmapped_roles: true
   delete_unmapped_channels: true
   delete_unmapped_emojis: true

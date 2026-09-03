@@ -62,6 +62,7 @@ class MirrorSettingsTests(unittest.TestCase):
         self.assertTrue(config["mirror"]["delete_unmapped_roles"])
         self.assertTrue(config["mirror"]["delete_unmapped_channels"])
         self.assertTrue(config["mirror"]["delete_unmapped_emojis"])
+        self.assertEqual(config["mirror"]["emoji_creations_per_reconcile"], 5)
 
     def test_mirror_settings_validate_types_and_intervals(self):
         settings = MirrorSettings.from_mapping(
@@ -80,6 +81,8 @@ class MirrorSettingsTests(unittest.TestCase):
             MirrorSettings.from_mapping({"enabled": "yes"})
         with self.assertRaises(ValueError):
             MirrorSettings.from_mapping({"reconcile_interval_minutes": 0})
+        with self.assertRaises(TypeError):
+            MirrorSettings.from_mapping({"emoji_creations_per_reconcile": 1.5})
 
     def test_production_guild_ids_are_not_hardcoded_in_python(self):
         source = "\n".join(
@@ -133,10 +136,11 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
         source = SimpleNamespace(id=MAIN_GUILD_ID, edit=AsyncMock())
         destination = SimpleNamespace(id=SUB_GUILD_ID)
         role_map = {10: object()}
-        emoji_map = {20: object()}
+        emoji_map = {20: SimpleNamespace(id=200)}
         channel_map = {30: object()}
         self.cog._sync_roles = AsyncMock(return_value=role_map)
         self.cog._sync_emojis = AsyncMock(return_value=emoji_map)
+        self.cog._existing_emoji_map = AsyncMock(return_value=emoji_map)
         self.cog._sync_channels = AsyncMock(return_value=channel_map)
         self.cog._ensure_destination_community = AsyncMock(
             return_value=(destination, False)
@@ -148,6 +152,7 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
 
         self.cog._sync_roles.assert_awaited_once_with(source, destination)
         self.cog._sync_emojis.assert_awaited_once_with(source, destination, role_map)
+        self.cog._existing_emoji_map.assert_awaited_once_with(destination)
         self.cog._sync_channels.assert_awaited_once_with(
             source, destination, role_map, emoji_map
         )
@@ -177,6 +182,13 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
         await self.cog._debounced_reconcile
 
         self.assertEqual(self.cog.reconcile_all.await_count, 2)
+
+    def test_destination_events_during_reconciliation_do_not_queue_a_pass(self):
+        self.cog._active_destination_ids.add(SUB_GUILD_ID)
+
+        self.cog._schedule_reconcile(SUB_GUILD_ID)
+
+        self.assertIsNone(self.cog._debounced_reconcile)
 
     async def test_member_roles_are_replaced_from_main_guild_authority(self):
         source_default = make_role(MAIN_GUILD_ID, default=True)
@@ -247,6 +259,61 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_channel_positions_use_relative_order_and_are_idempotent(self):
+        source_first = SimpleNamespace(id=10, position=4, category_id=None)
+        source_second = SimpleNamespace(id=11, position=19, category_id=None)
+        channel_type = SimpleNamespace(value=0)
+        destination_first = SimpleNamespace(
+            id=20,
+            position=0,
+            category_id=None,
+            _sorting_bucket=0,
+            type=channel_type,
+        )
+        destination_second = SimpleNamespace(
+            id=21,
+            position=1,
+            category_id=None,
+            _sorting_bucket=0,
+            type=channel_type,
+        )
+        http = SimpleNamespace(bulk_channel_update=AsyncMock())
+        destination = SimpleNamespace(
+            id=SUB_GUILD_ID,
+            _state=SimpleNamespace(http=http),
+        )
+
+        await self.cog._sync_channel_positions(
+            [source_second, source_first],
+            destination,
+            {
+                source_first.id: destination_first,
+                source_second.id: destination_second,
+            },
+        )
+
+        http.bulk_channel_update.assert_not_awaited()
+
+        destination_first.position = 1
+        destination_second.position = 0
+        await self.cog._sync_channel_positions(
+            [source_second, source_first],
+            destination,
+            {
+                source_first.id: destination_first,
+                source_second.id: destination_second,
+            },
+        )
+
+        http.bulk_channel_update.assert_awaited_once_with(
+            SUB_GUILD_ID,
+            [
+                {"id": destination_first.id, "position": 0},
+                {"id": destination_second.id, "position": 1},
+            ],
+            reason=MIRROR_REASON,
+        )
+
     async def test_existing_emoji_is_adopted_before_unmapped_cleanup(self):
         source_emoji = make_emoji(10, "same")
         destination_emoji = make_emoji(20, "same")
@@ -311,6 +378,8 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             features=["COMMUNITY"],
             rules_channel=rules,
             public_updates_channel=updates,
+            verification_level=discord.VerificationLevel.none,
+            explicit_content_filter=discord.ContentFilter.disabled,
         )
         detached_result = SimpleNamespace(id=SUB_GUILD_ID, channels=[])
         destination = SimpleNamespace(
@@ -333,7 +402,30 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             community=True,
             rules_channel=mirrored_rules,
             public_updates_channel=mirrored_updates,
+            verification_level=discord.VerificationLevel.low,
+            explicit_content_filter=discord.ContentFilter.all_members,
             reason=MIRROR_REASON,
+        )
+
+    def test_optional_role_style_falls_back_to_base_colour(self):
+        kwargs = {
+            "name": "gradient",
+            "colour": discord.Colour.red(),
+            "secondary_colour": discord.Colour.blue(),
+            "tertiary_colour": None,
+            "display_icon": b"icon",
+            "reason": MIRROR_REASON,
+        }
+
+        fallback = self.cog._without_optional_role_style(kwargs)
+
+        self.assertEqual(
+            fallback,
+            {
+                "name": "gradient",
+                "colour": discord.Colour.red(),
+                "reason": MIRROR_REASON,
+            },
         )
 
     async def test_missing_emoji_waits_for_a_later_free_slot(self):
@@ -376,6 +468,28 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             self.cog._save_entity_mapping.await_args_list[-1],
             call(SUB_GUILD_ID, "emoji", waiting_source.id, created_destination.id),
         )
+
+    async def test_emoji_creation_is_bounded_per_reconciliation(self):
+        source_emojis = [make_emoji(10 + index, f"emoji_{index}") for index in range(6)]
+        created_emojis = [
+            make_emoji(20 + index, f"emoji_{index}") for index in range(5)
+        ]
+        source = SimpleNamespace(id=MAIN_GUILD_ID, emojis=source_emojis)
+        destination = SimpleNamespace(
+            id=SUB_GUILD_ID,
+            emojis=[],
+            emoji_limit=50,
+            get_emoji=Mock(return_value=None),
+            create_custom_emoji=AsyncMock(side_effect=created_emojis),
+        )
+        self.cog._load_entity_map = AsyncMock(return_value={})
+        self.cog._save_entity_mapping = AsyncMock()
+        self.cog._delete_entity_mapping = AsyncMock()
+
+        result = await self.cog._sync_emojis(source, destination, {})
+
+        self.assertEqual(destination.create_custom_emoji.await_count, 5)
+        self.assertEqual(len(result), 5)
 
 
 if __name__ == "__main__":
