@@ -10,7 +10,6 @@ from cogs.sub_server_access import (
 
 MAIN_GUILD_ID = 1
 SUB_GUILD_ID = 2
-SHARING_ROLE_ID = 10
 USER_ID = 100
 
 
@@ -20,9 +19,7 @@ def make_role(role_id, position):
 
 class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.sharing_role = make_role(SHARING_ROLE_ID, 5)
         self.main_guild = Mock(id=MAIN_GUILD_ID)
-        self.main_guild.get_role.return_value = self.sharing_role
         self.sub_guild = Mock(id=SUB_GUILD_ID, members=[])
         self.sub_guild.kick = AsyncMock()
         self.sub_guild.ban = AsyncMock()
@@ -41,7 +38,6 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
             self.bot,
             SubServerSettings(
                 main_guild_id=MAIN_GUILD_ID,
-                required_role_id=SHARING_ROLE_ID,
                 sub_guild_ids=(SUB_GUILD_ID,),
             ),
         )
@@ -60,8 +56,8 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
             "CREATE TABLE IF NOT EXISTS sub_server_mirrored_bans", create_query
         )
 
-    async def test_sharing_role_is_eligible(self):
-        member = self.make_main_member([make_role(1, 0), self.sharing_role])
+    async def test_main_guild_member_is_eligible_without_a_required_role(self):
+        member = self.make_main_member([make_role(1, 0)])
         self.main_guild.get_member.return_value = member
 
         self.assertEqual(
@@ -69,18 +65,9 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
             AccessStatus.ELIGIBLE,
         )
 
-    async def test_role_above_sharing_does_not_grant_access(self):
-        member = self.make_main_member([make_role(11, self.sharing_role.position + 1)])
-        self.main_guild.get_member.return_value = member
-
-        self.assertEqual(
-            await self.cog._get_access_status(USER_ID),
-            AccessStatus.MISSING_REQUIRED_ROLE,
-        )
-
-    async def test_sub_server_join_without_required_role_is_kicked(self):
-        self.main_guild.get_member.return_value = self.make_main_member(
-            [make_role(1, 0)]
+    async def test_sub_server_join_without_main_membership_is_kicked(self):
+        self.cog._get_access_status = AsyncMock(
+            return_value=AccessStatus.NOT_IN_MAIN_GUILD
         )
 
         await self.cog.on_member_join(self.make_sub_member())
@@ -101,7 +88,7 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
         self.sub_guild.kick.assert_not_awaited()
 
     async def test_leaving_main_server_kicks_user_from_every_sub_server(self):
-        member = self.make_main_member([self.sharing_role])
+        member = self.make_main_member([make_role(1, 0)])
 
         await self.cog.on_member_remove(member)
 
@@ -204,15 +191,6 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
         self.sub_guild.unban.assert_not_awaited()
 
-    async def test_losing_required_role_kicks_user_from_sub_server(self):
-        before = self.make_main_member([self.sharing_role])
-        after = self.make_main_member([make_role(1, 0)])
-
-        await self.cog.on_member_update(before, after)
-
-        kicked_user = self.sub_guild.kick.await_args.args[0]
-        self.assertEqual(kicked_user.id, USER_ID)
-
     async def test_cannot_verify_does_not_mass_kick(self):
         self.cog._get_access_status = AsyncMock(return_value=AccessStatus.CANNOT_VERIFY)
 
@@ -227,7 +205,6 @@ class SubServerSettingsTests(unittest.TestCase):
         settings = SubServerSettings.from_mapping(
             {
                 "main_guild_id": "1",
-                "required_role_id": "10",
                 "sub_guild_ids": ["2", 2, 3],
             }
         )
@@ -239,7 +216,6 @@ class SubServerSettingsTests(unittest.TestCase):
             SubServerSettings.from_mapping(
                 {
                     "main_guild_id": 1,
-                    "required_role_id": 10,
                     "sub_guild_ids": [1],
                 }
             )

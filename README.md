@@ -164,6 +164,8 @@ User Actions:
 
 Automatically saves and restores user roles when they leave and rejoin the server. Runs every 10 minutes to save current roles and restores applicable roles when a user rejoins.
 
+Configured mirror destinations are deliberately excluded. Their member roles are derived one-way from the main guild, so backup-server changes can never replace authoritative role-restore data.
+
 Note: Requires configuration in `rank_saver_settings.yml` to define ignored roles and announcement channels. No user commands - fully automatic.
 
 ---
@@ -183,9 +185,17 @@ Note: Requires configuration in `selfmute_settings.yml` to define mute roles and
 
 #### `sub_server_access.py`
 
-Restricts configured sub-servers to members who are still in the main server and have the configured Sharing role. Ineligible users are kicked immediately, and main-server bans and unbans are mirrored to every sub-server. Mirrored bans are tracked so offline unbans can be repaired at startup without removing unrelated sub-server bans. Existing members are also checked whenever the bot starts.
+Restricts configured sub-servers to members who are still in the main server. Ineligible users are kicked immediately, and main-server bans and unbans are mirrored to every sub-server. Mirrored bans are tracked so offline unbans can be repaired at startup without removing unrelated sub-server bans. Existing members are also checked whenever the bot starts.
 
-No user commands - fully automatic. Server and role IDs are defined in `config/sub_server_settings.yml`. The bot needs the Server Members intent, Ban Members in the main server (to identify existing bans), and Kick Members and Ban Members in each sub-server.
+No user commands - fully automatic. Server IDs are defined in `config/sub_server_settings.yml`. The bot needs the Server Members intent, Ban Members in the main server (to identify existing bans), and Kick Members and Ban Members in each sub-server.
+
+---
+
+#### `sub_server_mirror.py`
+
+Maintains a one-way structural mirror from the configured main guild to its sub-server destinations. It copies regular role properties and order, channel/category layout and permission overwrites, supported guild settings, member roles, and as many static and animated emojis as the destination's current slots permit. Persisted ID mappings make startup reconciliation resumable and prevent duplicates. Periodic reconciliation fills newly available emoji slots later.
+
+The main guild is always read-only. Mirror destinations are authoritative only for Discord-assigned destination IDs; their role or layout edits are replaced from the main guild and never flow back into role restoration. For full fidelity, the bot needs Administrator in the destination and enough role hierarchy to manage every copied role. It only needs read access, Server Members, and Ban Members in the main guild.
 
 ---
 

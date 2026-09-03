@@ -1,9 +1,6 @@
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
-
-import yaml
 
 from cogs.auto_receive import AutoReceive
 
@@ -121,32 +118,6 @@ class AutoReceiveTests(unittest.IsolatedAsyncioTestCase):
                 }
             },
         )
-
-    def test_every_main_guild_rank_grants_the_required_sub_server_role(self):
-        auto_receive_settings = AutoReceive._normalize_settings(
-            yaml.safe_load(Path("config/auto_receive.yml").read_text(encoding="utf-8"))
-        )
-        gatekeeper_settings = yaml.safe_load(
-            Path("config/gatekeeper_settings.yml").read_text(encoding="utf-8")
-        )
-        sub_server_settings = yaml.safe_load(
-            Path("config/sub_server_settings.yml").read_text(encoding="utf-8")
-        )
-        main_guild_id = sub_server_settings["main_guild_id"]
-        required_role_id = sub_server_settings["required_role_id"]
-
-        rank_role_ids = {
-            rank["rank_to_get"]
-            for rank in gatekeeper_settings["rank_structure"][main_guild_id]
-            if rank["rank_to_get"] is not None
-        }
-
-        for rank_role_id in rank_role_ids:
-            with self.subTest(rank_role_id=rank_role_id):
-                self.assertIn(
-                    required_role_id,
-                    auto_receive_settings[main_guild_id].get(rank_role_id, ()),
-                )
 
 
 if __name__ == "__main__":

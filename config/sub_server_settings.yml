@@ -1,9 +1,19 @@
 # Members of a sub-server must also be members of this server.
 main_guild_id: 617136488840429598
 
-# Sharing in the main server. Members must have this exact role.
-required_role_id: 1301694741083328565
-
 # Add one or more sub-server IDs here.
 sub_guild_ids:
-  - 1539508913102262284
+  - 1545132788997427260
+
+# Everything in this section is applied one-way: main guild -> sub-server.
+mirror:
+  enabled: true
+  reconcile_interval_minutes: 30
+  event_debounce_seconds: 10
+  mutation_delay_seconds: 0.5
+  emoji_create_delay_seconds: 5
+  delete_unmapped_roles: true
+  delete_unmapped_channels: true
+  delete_unmapped_emojis: true
+  mirror_guild_settings: true
+  mirror_member_roles: true

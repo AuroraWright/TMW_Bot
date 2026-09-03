@@ -49,19 +49,17 @@ WHERE main_guild_id = ? AND sub_guild_id = ? AND user_id = ?;"""
 @dataclass(frozen=True)
 class SubServerSettings:
     main_guild_id: int
-    required_role_id: int
     sub_guild_ids: tuple[int, ...]
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "SubServerSettings":
         try:
             main_guild_id = int(data["main_guild_id"])
-            required_role_id = int(data["required_role_id"])
             configured_sub_guild_ids = data["sub_guild_ids"]
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(
-                "Sub-server settings require integer main_guild_id and "
-                "required_role_id values, plus a sub_guild_ids list."
+                "Sub-server settings require an integer main_guild_id and a "
+                "sub_guild_ids list."
             ) from error
 
         if not isinstance(configured_sub_guild_ids, list):
@@ -79,7 +77,6 @@ class SubServerSettings:
 
         return cls(
             main_guild_id=main_guild_id,
-            required_role_id=required_role_id,
             sub_guild_ids=sub_guild_ids,
         )
 
@@ -99,7 +96,6 @@ sub_server_settings = load_sub_server_settings(SUB_SERVER_SETTINGS_PATH)
 class AccessStatus(Enum):
     ELIGIBLE = "eligible"
     NOT_IN_MAIN_GUILD = "not_in_main_guild"
-    MISSING_REQUIRED_ROLE = "missing_required_role"
     BANNED_FROM_MAIN_GUILD = "banned_from_main_guild"
     CANNOT_VERIFY = "cannot_verify"
 
@@ -131,28 +127,11 @@ class SubServerAccess(commands.Cog):
     def _is_bot_user(self, user_id: int) -> bool:
         return self.bot.user is not None and user_id == self.bot.user.id
 
-    @staticmethod
-    def _has_required_role(
-        member: discord.Member,
-        required_role: discord.Role,
-    ) -> bool:
-        return any(role.id == required_role.id for role in member.roles)
-
     async def _get_access_status(self, user_id: int) -> AccessStatus:
         main_guild = self._get_main_guild()
         if main_guild is None:
             _log.error(
                 "Cannot verify sub-server access because main guild %s is unavailable.",
-                self.settings.main_guild_id,
-            )
-            return AccessStatus.CANNOT_VERIFY
-
-        required_role = main_guild.get_role(self.settings.required_role_id)
-        if required_role is None:
-            _log.error(
-                "Cannot verify sub-server access because role %s is missing from "
-                "main guild %s.",
-                self.settings.required_role_id,
                 self.settings.main_guild_id,
             )
             return AccessStatus.CANNOT_VERIFY
@@ -172,9 +151,7 @@ class SubServerAccess(commands.Cog):
                 )
                 return AccessStatus.CANNOT_VERIFY
 
-        if self._has_required_role(main_member, required_role):
-            return AccessStatus.ELIGIBLE
-        return AccessStatus.MISSING_REQUIRED_ROLE
+        return AccessStatus.ELIGIBLE
 
     async def _status_for_non_member(
         self,
@@ -323,9 +300,6 @@ class SubServerAccess(commands.Cog):
 
         reasons = {
             AccessStatus.NOT_IN_MAIN_GUILD: "User is not in the main server.",
-            AccessStatus.MISSING_REQUIRED_ROLE: (
-                "User does not have the required role in the main server."
-            ),
         }
         await self._kick_from_sub_guild(
             member.guild,
@@ -493,28 +467,6 @@ class SubServerAccess(commands.Cog):
                     user.id,
                     "User was unbanned from the main server.",
                 )
-
-    @commands.Cog.listener()
-    async def on_member_update(
-        self,
-        before: discord.Member,
-        after: discord.Member,
-    ) -> None:
-        if after.guild.id != self.settings.main_guild_id:
-            return
-        if before.roles == after.roles or self._is_bot_user(after.id):
-            return
-
-        required_role = after.guild.get_role(self.settings.required_role_id)
-        if required_role is None or self._has_required_role(after, required_role):
-            return
-
-        for sub_guild in self._get_sub_guilds():
-            await self._kick_from_sub_guild(
-                sub_guild,
-                after.id,
-                "User lost the required role in the main server.",
-            )
 
 
 async def setup(bot: TMWBot) -> None:
