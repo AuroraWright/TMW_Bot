@@ -2,7 +2,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import discord
 
 from lib.bot import TMWBot
 
@@ -35,6 +38,24 @@ class BotConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 for extension in list(bot.extensions):
                     await bot.unload_extension(extension)
                 await bot.close()
+
+    async def test_missing_application_permissions_are_rejected_privately(self):
+        response = SimpleNamespace(send_message=AsyncMock())
+        interaction = SimpleNamespace(
+            command=SimpleNamespace(name="assign_quiz"),
+            user=SimpleNamespace(id=100),
+            response=response,
+        )
+
+        await TMWBot.on_application_command_error(
+            SimpleNamespace(),
+            interaction,
+            discord.app_commands.MissingPermissions(["administrator"]),
+        )
+
+        response.send_message.assert_awaited_once_with(
+            "You do not have permission to use this command.", ephemeral=True
+        )
 
 
 if __name__ == "__main__":
