@@ -1553,6 +1553,34 @@ class SubServerMirror(commands.Cog):
                 error,
             )
 
+    async def _get_source_member(
+        self,
+        source_guild: discord.Guild,
+        user_id: int,
+    ) -> discord.Member | None:
+        """Resolve a main-guild member without relying only on the local cache.
+
+        The access cog already uses the REST fallback when it validates a
+        sub-server member.  Role syncing must do the same: a member can be
+        valid in the main guild while the gateway cache is still incomplete
+        (or has not received that member yet).
+        """
+        source_member = source_guild.get_member(user_id)
+        if source_member is not None:
+            return source_member
+        try:
+            return await source_guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            _log.warning(
+                "Could not fetch member %s from main guild %s for role sync: %s",
+                user_id,
+                source_guild.id,
+                error,
+            )
+            return None
+
     async def _sync_all_member_roles(
         self,
         source_guild: discord.Guild,
@@ -1561,14 +1589,33 @@ class SubServerMirror(commands.Cog):
     ) -> None:
         if not self.settings.mirror_member_roles:
             return
-        for destination_member in list(destination_guild.members):
-            if self.bot.user is not None and destination_member.id == self.bot.user.id:
+
+        destination_members = [
+            member
+            for member in list(destination_guild.members)
+            if self.bot.user is None or member.id != self.bot.user.id
+        ]
+        synced_count = 0
+        unresolved_count = 0
+        for destination_member in destination_members:
+            source_member = await self._get_source_member(
+                source_guild, destination_member.id
+            )
+            if source_member is None:
+                unresolved_count += 1
                 continue
-            source_member = source_guild.get_member(destination_member.id)
-            if source_member is not None:
-                await self._sync_member_roles_unlocked(
-                    source_member, destination_member, role_map
-                )
+            await self._sync_member_roles_unlocked(
+                source_member, destination_member, role_map
+            )
+            synced_count += 1
+
+        _log.info(
+            "Member role mirror phase completed for sub-server %s (%s/%s members synced; %s main members could not be resolved).",
+            destination_guild.id,
+            synced_count,
+            len(destination_members),
+            unresolved_count,
+        )
 
     async def _sync_member_channel_overwrites_unlocked(
         self,
@@ -1708,8 +1755,15 @@ class SubServerMirror(commands.Cog):
             if source_guild is None:
                 return
             self._validate_direction(source_guild, destination_member.guild)
-            source_member = source_guild.get_member(destination_member.id)
+            source_member = await self._get_source_member(
+                source_guild, destination_member.id
+            )
             if source_member is None:
+                _log.warning(
+                    "Could not mirror roles for member %s in sub-server %s because they are not currently in the main guild.",
+                    destination_member.id,
+                    destination_member.guild.id,
+                )
                 return
             mapping_ids = await self._load_entity_map(
                 destination_member.guild.id, "role"
@@ -1723,6 +1777,21 @@ class SubServerMirror(commands.Cog):
                     is not None
                 }
             )
+            missing_role_ids = {
+                role.id
+                for role in source_member.roles
+                if not role.is_default()
+                and not role.managed
+                and role.id not in role_map
+            }
+            if missing_role_ids:
+                _log.warning(
+                    "Role mappings are incomplete for member %s in sub-server %s (%s main roles missing); queueing a mirror reconciliation.",
+                    destination_member.id,
+                    destination_member.guild.id,
+                    len(missing_role_ids),
+                )
+                self._schedule_reconcile(destination_member.guild.id)
             await self._sync_member_roles_unlocked(
                 source_member, destination_member, role_map
             )

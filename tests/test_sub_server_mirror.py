@@ -228,6 +228,68 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
             destination_remove, reason=MIRROR_REASON
         )
 
+    async def test_member_role_sync_fetches_main_member_when_cache_misses(self):
+        source_default = make_role(MAIN_GUILD_ID, default=True)
+        source_keep = make_role(10)
+        source_member = SimpleNamespace(
+            id=MEMBER_ID,
+            roles=[source_default, source_keep],
+            guild=SimpleNamespace(channels=[]),
+        )
+        source_guild = SimpleNamespace(
+            id=MAIN_GUILD_ID,
+            default_role=source_default,
+            get_member=Mock(return_value=None),
+            fetch_member=AsyncMock(return_value=source_member),
+        )
+        destination_default = make_role(SUB_GUILD_ID, default=True)
+        destination_keep = make_role(20)
+        destination_guild = SimpleNamespace(
+            id=SUB_GUILD_ID,
+            default_role=destination_default,
+            get_role=Mock(return_value=destination_keep),
+            get_channel=Mock(return_value=None),
+        )
+        destination_member = SimpleNamespace(
+            id=MEMBER_ID,
+            guild=destination_guild,
+            roles=[destination_default],
+            add_roles=AsyncMock(),
+            remove_roles=AsyncMock(),
+        )
+        self.bot.get_guild.return_value = source_guild
+        self.bot.GET = AsyncMock(
+            side_effect=[[(source_keep.id, destination_keep.id)], []]
+        )
+
+        await self.cog.sync_member_roles(destination_member)
+
+        source_guild.fetch_member.assert_awaited_once_with(MEMBER_ID)
+        destination_member.add_roles.assert_awaited_once_with(
+            destination_keep, reason=MIRROR_REASON
+        )
+
+    async def test_existing_sub_members_are_backfilled_when_main_cache_misses(self):
+        source_member = SimpleNamespace(id=MEMBER_ID)
+        source_guild = SimpleNamespace(
+            id=MAIN_GUILD_ID,
+            get_member=Mock(return_value=None),
+            fetch_member=AsyncMock(return_value=source_member),
+        )
+        destination_member = SimpleNamespace(id=MEMBER_ID)
+        destination_guild = SimpleNamespace(
+            id=SUB_GUILD_ID,
+            members=[destination_member],
+        )
+        self.cog._sync_member_roles_unlocked = AsyncMock()
+
+        await self.cog._sync_all_member_roles(source_guild, destination_guild, {})
+
+        source_guild.fetch_member.assert_awaited_once_with(MEMBER_ID)
+        self.cog._sync_member_roles_unlocked.assert_awaited_once_with(
+            source_member, destination_member, {}
+        )
+
     def test_role_positions_preserve_relative_order_across_managed_role_gaps(self):
         source_low = make_role(10, position=1)
         source_managed = make_role(11, managed=True, position=5)
