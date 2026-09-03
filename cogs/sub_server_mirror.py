@@ -365,6 +365,37 @@ class SubServerMirror(commands.Cog):
         await self._mutation_pause()
         return updated or destination_role
 
+    @staticmethod
+    def _role_order_key(role: discord.Role) -> tuple[int, int]:
+        """Sort roles from lowest to highest, including tied positions."""
+        return (role.position, -role.id)
+
+    @classmethod
+    def _mirrored_role_positions(
+        cls,
+        source_roles: list[discord.Role],
+        role_map: Mapping[int, discord.Role],
+    ) -> dict[discord.Role, int]:
+        """Return contiguous positions preserving the source's relative order.
+
+        Absolute positions cannot be copied between guilds because Discord counts
+        managed roles in them, and managed roles differ between guilds. Mirrored
+        editable roles are therefore packed below the destination bot's managed
+        role while retaining their source hierarchy.
+        """
+        ordered_destination_roles = [
+            destination_role
+            for source_role in sorted(source_roles, key=cls._role_order_key)
+            if (destination_role := role_map.get(source_role.id)) is not None
+            and not destination_role.managed
+            and destination_role.is_assignable()
+        ]
+        return {
+            role: position
+            for position, role in enumerate(ordered_destination_roles, start=1)
+            if role.position != position
+        }
+
     async def _sync_roles(
         self,
         source_guild: discord.Guild,
@@ -375,7 +406,10 @@ class SubServerMirror(commands.Cog):
             source_guild.default_role.id: destination_guild.default_role
         }
         used_destination_ids = {destination_guild.default_role.id}
-        source_roles = [role for role in source_guild.roles if not role.is_default()]
+        source_roles = sorted(
+            (role for role in source_guild.roles if not role.is_default()),
+            key=self._role_order_key,
+        )
         destination_supports_role_icons = self._supports_role_icons(destination_guild)
 
         if (
@@ -391,7 +425,9 @@ class SubServerMirror(commands.Cog):
             except (discord.Forbidden, discord.HTTPException) as error:
                 _log.error("Failed to mirror @everyone permissions: %s", error)
 
-        for source_role in source_roles:
+        # Discord inserts every newly created role at the bottom. Creating from the
+        # top down makes the initial hierarchy correct even before the bulk move.
+        for source_role in reversed(source_roles):
             destination_role = self._matching_bot_role(source_role, destination_guild)
             mapped_id = mapping_ids.get(source_role.id)
             if destination_role is None and mapped_id is not None:
@@ -472,14 +508,7 @@ class SubServerMirror(commands.Cog):
                         error,
                     )
 
-        positions = {
-            role_map[source_role.id]: source_role.position
-            for source_role in source_roles
-            if source_role.id in role_map
-            and not role_map[source_role.id].managed
-            and role_map[source_role.id].is_assignable()
-            and role_map[source_role.id].position != source_role.position
-        }
+        positions = self._mirrored_role_positions(source_roles, role_map)
         if positions:
             try:
                 await destination_guild.edit_role_positions(
@@ -1395,12 +1424,31 @@ class SubServerMirror(commands.Cog):
             destination_guild.id,
         )
         role_map = await self._sync_roles(source_guild, destination_guild)
+        _log.info(
+            "Role mirror phase completed for sub-server %s (%s roles mapped).",
+            destination_guild.id,
+            max(len(role_map) - 1, 0),
+        )
         emoji_map = await self._sync_emojis(source_guild, destination_guild, role_map)
+        _log.info(
+            "Emoji mirror phase completed for sub-server %s (%s emojis mapped; slot-limited emojis will retry later).",
+            destination_guild.id,
+            len(emoji_map),
+        )
+        _log.info(
+            "Starting channel mirror phase for sub-server %s.",
+            destination_guild.id,
+        )
         channel_map = await self._sync_channels(
             source_guild,
             destination_guild,
             role_map,
             emoji_map,
+        )
+        _log.info(
+            "Channel mirror phase completed for sub-server %s (%s channels mapped).",
+            destination_guild.id,
+            len(channel_map),
         )
         destination_guild, community_enabled = await self._ensure_destination_community(
             source_guild, destination_guild, channel_map

@@ -19,10 +19,18 @@ SUB_GUILD_ID = 2
 MEMBER_ID = 100
 
 
-def make_role(role_id, *, default=False, managed=False, assignable=True):
+def make_role(
+    role_id,
+    *,
+    default=False,
+    managed=False,
+    assignable=True,
+    position=1,
+):
     role = SimpleNamespace(
         id=role_id,
         managed=managed,
+        position=position,
         is_default=Mock(return_value=default),
         is_assignable=Mock(return_value=assignable),
     )
@@ -203,6 +211,40 @@ class SubServerMirrorTests(unittest.IsolatedAsyncioTestCase):
         )
         destination_member.remove_roles.assert_awaited_once_with(
             destination_remove, reason=MIRROR_REASON
+        )
+
+    def test_role_positions_preserve_relative_order_across_managed_role_gaps(self):
+        source_low = make_role(10, position=1)
+        source_managed = make_role(11, managed=True, position=5)
+        source_middle = make_role(12, position=8)
+        source_high = make_role(13, position=20)
+
+        def destination_role(role_id, position, *, managed=False):
+            role = Mock(id=role_id, position=position, managed=managed)
+            role.is_assignable.return_value = not managed
+            return role
+
+        destination_low = destination_role(20, 3)
+        destination_managed = destination_role(21, 4, managed=True)
+        destination_middle = destination_role(22, 2)
+        destination_high = destination_role(23, 1)
+
+        positions = self.cog._mirrored_role_positions(
+            [source_high, source_low, source_middle, source_managed],
+            {
+                source_low.id: destination_low,
+                source_managed.id: destination_managed,
+                source_middle.id: destination_middle,
+                source_high.id: destination_high,
+            },
+        )
+
+        self.assertEqual(
+            positions,
+            {
+                destination_low: 1,
+                destination_high: 3,
+            },
         )
 
     async def test_existing_emoji_is_adopted_before_unmapped_cleanup(self):
