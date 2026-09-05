@@ -218,7 +218,7 @@ The main guild is always read-only. Mirror destinations are authoritative only f
 Allows moderators to make messages "sticky" in channels, meaning they will reappear after new messages, making the message always visible at the bottom of the channel.
 
 Commands:
-* `/sticky_last_message` - Make the last message in the channel sticky (ignoring bot commands). Requires manage messages permission by default.
+* `/sticky_last_message` - Make the last message in the channel sticky, including bot/app messages (while ignoring this command's own interaction messages). Requires manage messages permission by default.
 * `/unsticky` - Remove the current sticky message from the channel. Requires manage messages permission by default.
 
 ---
