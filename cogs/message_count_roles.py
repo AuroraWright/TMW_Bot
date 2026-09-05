@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import time
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -153,6 +154,7 @@ class MessageCountRoleSettings:
     auto_receive_interval_minutes: float = 15.0
     history_batch_size: int = 100
     history_batch_delay_seconds: float = 0.25
+    award_worker_count: int = 2
     rules: tuple[MessageCountRoleRule, ...] = ()
 
     @classmethod
@@ -218,6 +220,13 @@ class MessageCountRoleSettings:
             "history_batch_size",
             minimum=1,
         )
+        award_worker_count = _integer(
+            data.get("award_worker_count", cls().award_worker_count),
+            "award_worker_count",
+            minimum=1,
+        )
+        if award_worker_count > 8:
+            raise ValueError("award_worker_count cannot be greater than 8.")
 
         configured_rules = data.get("rules", [])
         if isinstance(configured_rules, Mapping):
@@ -248,6 +257,7 @@ class MessageCountRoleSettings:
             auto_receive_interval_minutes=auto_receive_interval_minutes,
             history_batch_size=history_batch_size,
             history_batch_delay_seconds=history_batch_delay_seconds,
+            award_worker_count=award_worker_count,
             rules=rules,
         )
 
@@ -261,6 +271,22 @@ def load_message_count_role_settings(path: Path) -> MessageCountRoleSettings:
 message_count_role_settings = load_message_count_role_settings(
     MESSAGE_COUNT_ROLE_SETTINGS_PATH
 )
+
+
+@dataclass
+class _AwardRequest:
+    """A deduplicated role award waiting in the priority queue."""
+
+    key: tuple[str, int]
+    rule: MessageCountRoleRule
+    member: discord.Member
+    source: str
+    priority: int
+    sequence: int
+    generation: int
+    future: asyncio.Future[bool]
+    enqueued_at: float
+    started: bool = False
 
 
 class MessageCountRoles(commands.Cog):
@@ -281,10 +307,19 @@ class MessageCountRoles(commands.Cog):
         self._live_message_ids: dict[tuple[str, int], set[int]] = defaultdict(set)
         self._state_lock = asyncio.Lock()
         self._scan_lock = asyncio.Lock()
-        self._award_lock = asyncio.Lock()
+        self._inline_award_lock = asyncio.Lock()
+        self._award_queue: asyncio.PriorityQueue[
+            tuple[int, int, int, _AwardRequest]
+        ] = asyncio.PriorityQueue()
+        self._award_workers: list[asyncio.Task[None]] = []
+        self._pending_awards: dict[tuple[str, int], _AwardRequest] = {}
+        self._award_sequence = 0
         self._destination_member_cache: dict[tuple[int, int], discord.Member] = {}
         self._awarded_users: set[tuple[str, int]] = set()
         self._messages_since_flush = 0
+
+    _AWARD_PRIORITY_LIVE = 0
+    _AWARD_PRIORITY_BACKFILL = 10
 
     async def cog_load(self) -> None:
         await self.bot.RUN(CREATE_MESSAGE_COUNT_ROLE_COUNTS_TABLE)
@@ -314,6 +349,7 @@ class MessageCountRoles(commands.Cog):
     async def cog_unload(self) -> None:
         self.periodic_reconcile.cancel()
         self.auto_receive_reconcile.cancel()
+        await self._stop_award_workers()
         await self._flush_dirty_counts()
 
     @staticmethod
@@ -506,8 +542,16 @@ class MessageCountRoles(commands.Cog):
             self._messages_since_flush += 1
             crossed_threshold = new_count == rule.message_threshold
 
-        if crossed_threshold:
-            await self._award_cached_member(rule, user_id)
+        # Historical scans only update durable counters here.  Awarding from
+        # this hot loop would serialize the scan on a destination API request;
+        # the resumable backfill phase queues all qualifying members afterward.
+        if crossed_threshold and not from_history:
+            await self._award_cached_member(
+                rule,
+                user_id,
+                priority=self._AWARD_PRIORITY_LIVE,
+                source="live-threshold",
+            )
         return True
 
     async def _flush_dirty_counts(self) -> None:
@@ -605,18 +649,187 @@ class MessageCountRoles(commands.Cog):
         )
         return True
 
+    def _award_workers_are_running(self) -> bool:
+        """Return whether at least one award worker can service the queue."""
+        active_workers = [worker for worker in self._award_workers if not worker.done()]
+        self._award_workers = active_workers
+        return bool(active_workers)
+
+    def _start_award_workers(self) -> None:
+        """Start the bounded award workers after the bot has connected."""
+        if not self.settings.enabled or not self.settings.rules:
+            return
+        if self._award_workers_are_running():
+            return
+        self._award_workers = [
+            asyncio.create_task(
+                self._award_worker(index),
+                name=f"message-count-role-award-{index}",
+            )
+            for index in range(self.settings.award_worker_count)
+        ]
+        _log.info(
+            "Started %s message-count role award workers (live awards have priority over backfill).",
+            len(self._award_workers),
+        )
+
+    async def _stop_award_workers(self) -> None:
+        """Stop workers and resolve queued requests during cog shutdown/reload."""
+        workers = self._award_workers
+        self._award_workers = []
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        for request in self._pending_awards.values():
+            if not request.future.done():
+                request.future.set_result(False)
+        self._pending_awards.clear()
+
+        while True:
+            try:
+                self._award_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._award_queue.task_done()
+
+    async def _award_worker(self, worker_index: int) -> None:
+        """Process role awards with priority and per-user deduplication."""
+        while True:
+            priority, _sequence, generation, request = await self._award_queue.get()
+            try:
+                if (
+                    self._pending_awards.get(request.key) is not request
+                    or request.generation != generation
+                    or request.started
+                ):
+                    continue
+
+                request.started = True
+                started_at = time.monotonic()
+                try:
+                    result = await self._award_member(request.rule, request.member)
+                except asyncio.CancelledError:
+                    self._pending_awards.pop(request.key, None)
+                    if not request.future.done():
+                        request.future.set_result(False)
+                    raise
+                except Exception:  # noqa: BLE001 - keep the worker alive
+                    _log.exception(
+                        "Unexpected failure while awarding message-count role to member %s in rule %s.",
+                        request.member.id,
+                        request.rule.name,
+                    )
+                    result = False
+
+                finished_at = time.monotonic()
+                self._pending_awards.pop(request.key, None)
+                if not request.future.done():
+                    request.future.set_result(result)
+                _log.info(
+                    "Completed message-count role award for member %s in rule %s (source=%s, priority=%s, queue_wait=%.2fs, request_time=%.2fs, result=%s, worker=%s).",
+                    request.member.id,
+                    request.rule.name,
+                    request.source,
+                    priority,
+                    max(0.0, started_at - request.enqueued_at),
+                    max(0.0, finished_at - started_at),
+                    result,
+                    worker_index,
+                )
+            finally:
+                self._award_queue.task_done()
+
+    async def _queue_award(
+        self,
+        rule: MessageCountRoleRule,
+        member: discord.Member,
+        *,
+        priority: int,
+        source: str,
+    ) -> bool:
+        """Queue a role award, or process it inline before workers are ready."""
+        if not self._award_workers_are_running():
+            async with self._inline_award_lock:
+                started_at = time.monotonic()
+                result = await self._award_member(rule, member)
+                _log.info(
+                    "Completed inline message-count role award for member %s in rule %s (source=%s, request_time=%.2fs, result=%s).",
+                    member.id,
+                    rule.name,
+                    source,
+                    max(0.0, time.monotonic() - started_at),
+                    result,
+                )
+                return result
+
+        key = (rule.name, member.id)
+        existing = self._pending_awards.get(key)
+        if existing is not None and not existing.future.done():
+            if priority < existing.priority and not existing.started:
+                existing.priority = priority
+                existing.source = source
+                existing.generation += 1
+                existing.sequence = self._award_sequence
+                self._award_sequence += 1
+                self._award_queue.put_nowait(
+                    (
+                        existing.priority,
+                        existing.sequence,
+                        existing.generation,
+                        existing,
+                    )
+                )
+            return await asyncio.shield(existing.future)
+
+        loop = asyncio.get_running_loop()
+        request = _AwardRequest(
+            key=key,
+            rule=rule,
+            member=member,
+            source=source,
+            priority=priority,
+            sequence=self._award_sequence,
+            generation=0,
+            future=loop.create_future(),
+            enqueued_at=time.monotonic(),
+        )
+        self._award_sequence += 1
+        self._pending_awards[key] = request
+        self._award_queue.put_nowait(
+            (request.priority, request.sequence, request.generation, request)
+        )
+        return await asyncio.shield(request.future)
+
     async def _award_member_safely(
         self,
         rule: MessageCountRoleRule,
         member: discord.Member,
+        *,
+        priority: int | None = None,
+        source: str = "event",
     ) -> bool:
-        async with self._award_lock:
-            return await self._award_member(rule, member)
+        """Award through the live-priority queue by default."""
+        return await self._queue_award(
+            rule,
+            member,
+            priority=(
+                self._AWARD_PRIORITY_LIVE
+                if priority is None
+                else priority
+            ),
+            source=source,
+        )
 
     async def _award_cached_member(
         self,
         rule: MessageCountRoleRule,
         user_id: int,
+        *,
+        priority: int = _AWARD_PRIORITY_LIVE,
+        source: str = "threshold",
     ) -> None:
         destination_guild = self._get_destination_guild(rule)
         if destination_guild is None:
@@ -645,7 +858,12 @@ class MessageCountRoles(commands.Cog):
                     return
         if member is not None:
             self._destination_member_cache[(destination_guild.id, member.id)] = member
-            await self._award_member_safely(rule, member)
+            await self._award_member_safely(
+                rule,
+                member,
+                priority=priority,
+                source=source,
+            )
 
     async def _refresh_counts_from_database(
         self,
@@ -794,14 +1012,34 @@ class MessageCountRoles(commands.Cog):
             destination_guild,
             qualifying_user_ids,
         )
-        awarded_count = 0
-        for member in destination_members:
-            if await self._award_member_safely(rule, member):
-                awarded_count += 1
+        award_results = await asyncio.gather(
+            *(
+                self._award_member_safely(
+                    rule,
+                    member,
+                    priority=self._AWARD_PRIORITY_BACKFILL,
+                    source="backfill",
+                )
+                for member in destination_members
+            ),
+            return_exceptions=True,
+        )
+        processed_count = sum(
+            1 for result in award_results if result is True
+        )
+        for member, result in zip(destination_members, award_results, strict=False):
+            if isinstance(result, Exception):
+                _log.error(
+                    "Message-count role backfill award failed for member %s in rule %s: %s",
+                    member.id,
+                    rule.name,
+                    result,
+                )
         _log.info(
-            "Message-count role backfill processed %s of %s qualifying users in guild %s.",
-            awarded_count,
+            "Message-count role backfill processed %s destination members out of %s qualifying users (%s destination candidates) in guild %s.",
+            processed_count,
             len(qualifying_user_ids),
+            len(destination_members),
             destination_guild.id,
         )
 
@@ -932,6 +1170,11 @@ class MessageCountRoles(commands.Cog):
         if (
             self.settings.enabled
             and self.settings.rules
+        ):
+            self._start_award_workers()
+        if (
+            self.settings.enabled
+            and self.settings.rules
             and not self.periodic_reconcile.is_running()
         ):
             self.periodic_reconcile.start()
@@ -969,11 +1212,23 @@ class MessageCountRoles(commands.Cog):
             if member.guild.id != rule.destination_guild_id:
                 continue
             self._destination_member_cache[(member.guild.id, member.id)] = member
-            if (
-                await self._refresh_count_for_user(rule, member.id)
-                >= rule.message_threshold
-            ):
-                await self._award_member_safely(rule, member)
+            lookup_started_at = time.monotonic()
+            message_count = await self._refresh_count_for_user(rule, member.id)
+            _log.info(
+                "Checked message-count role eligibility for member %s in rule %s (count=%s, threshold=%s, lookup_time=%.2fs).",
+                member.id,
+                rule.name,
+                message_count,
+                rule.message_threshold,
+                max(0.0, time.monotonic() - lookup_started_at),
+            )
+            if message_count >= rule.message_threshold:
+                await self._award_member_safely(
+                    rule,
+                    member,
+                    priority=self._AWARD_PRIORITY_LIVE,
+                    source="member-join",
+                )
 
     @commands.Cog.listener()
     async def on_member_update(
@@ -996,7 +1251,12 @@ class MessageCountRoles(commands.Cog):
                 self._counts.get(rule.name, {}).get(after.id, 0)
                 >= rule.message_threshold
             ):
-                await self._award_member_safely(rule, after)
+                await self._award_member_safely(
+                    rule,
+                    after,
+                    priority=self._AWARD_PRIORITY_LIVE,
+                    source="member-update",
+                )
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:

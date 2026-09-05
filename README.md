@@ -31,7 +31,11 @@ and counts are persisted so a long initial scan can continue after a restart.
 An independent auto-receive pass periodically retries missed grants and fetches
 destination members that are absent from the local cache. Excluded channel IDs
 also exclude their child threads. A user must be present in the destination
-guild to receive the role.
+guild to receive the role. Role awards are deduplicated through a bounded
+priority queue: live joins and threshold crossings are handled before
+lower-priority historical backfill. The worker count is configurable with
+`award_worker_count` in `config/message_count_roles.yml` (keep it conservative
+to avoid Discord rate limits).
 
 ---
 

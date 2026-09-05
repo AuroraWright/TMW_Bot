@@ -7,6 +7,9 @@ reconcile_interval_minutes: 30
 auto_receive_interval_minutes: 15
 history_batch_size: 100
 history_batch_delay_seconds: 0.25
+# Role awards use a small bounded worker pool. Live joins/threshold crossings
+# take priority over the periodic backfill; keep this low to avoid 429s.
+award_worker_count: 2
 
 rules:
   # Keep this rule name stable so persisted counters/cursors survive threshold changes.

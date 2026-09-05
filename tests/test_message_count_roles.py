@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,7 @@ class MessageCountRoleSettingsTests(unittest.TestCase):
         self.assertEqual(rule["destination_role_id"], 1545600348033384469)
         self.assertEqual(rule["message_threshold"], 20)
         self.assertEqual(config["auto_receive_interval_minutes"], 15)
+        self.assertEqual(config["award_worker_count"], 2)
         self.assertEqual(
             rule["excluded_channel_ids"],
             [1027706916874506311, 1345775806399647907, 814947177608118273],
@@ -305,6 +307,88 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
             self.destination_role,
             reason="Reached the configured message-count role threshold",
         )
+
+    async def test_award_workers_prioritize_live_requests_over_backfill(self):
+        settings = MessageCountRoleSettings(
+            enabled=True,
+            retroactive_scan=True,
+            monitor_new_messages=True,
+            reconcile_interval_minutes=30,
+            award_worker_count=1,
+            rules=(self.rule,),
+        )
+        cog = MessageCountRoles(self.bot, settings)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        processed_ids = []
+
+        async def award_member(_rule, member):
+            processed_ids.append(member.id)
+            if member.id == 1:
+                first_started.set()
+                await release_first.wait()
+            return True
+
+        cog._award_member = award_member
+        cog._start_award_workers()
+        members = [SimpleNamespace(id=index, bot=False) for index in (1, 2, 3)]
+        first = asyncio.create_task(
+            cog._award_member_safely(
+                self.rule,
+                members[0],
+                priority=cog._AWARD_PRIORITY_BACKFILL,
+                source="backfill",
+            )
+        )
+        await first_started.wait()
+        second = asyncio.create_task(
+            cog._award_member_safely(
+                self.rule,
+                members[1],
+                priority=cog._AWARD_PRIORITY_BACKFILL,
+                source="backfill",
+            )
+        )
+        third = asyncio.create_task(
+            cog._award_member_safely(
+                self.rule,
+                members[2],
+                priority=cog._AWARD_PRIORITY_LIVE,
+                source="member-join",
+            )
+        )
+        await asyncio.sleep(0)
+        release_first.set()
+
+        self.assertEqual(await first, True)
+        self.assertEqual(await third, True)
+        self.assertEqual(await second, True)
+        self.assertEqual(processed_ids, [1, 3, 2])
+        await cog._stop_award_workers()
+
+    async def test_duplicate_awards_share_one_queued_request(self):
+        settings = MessageCountRoleSettings(
+            enabled=True,
+            retroactive_scan=True,
+            monitor_new_messages=True,
+            reconcile_interval_minutes=30,
+            award_worker_count=1,
+            rules=(self.rule,),
+        )
+        cog = MessageCountRoles(self.bot, settings)
+        award_member = AsyncMock(return_value=True)
+        cog._award_member = award_member
+        cog._start_award_workers()
+        member = SimpleNamespace(id=USER_ID, bot=False)
+
+        results = await asyncio.gather(
+            cog._award_member_safely(self.rule, member, source="member-join"),
+            cog._award_member_safely(self.rule, member, source="member-update"),
+        )
+
+        self.assertEqual(results, [True, True])
+        award_member.assert_awaited_once_with(self.rule, member)
+        await cog._stop_award_workers()
 
 
 if __name__ == "__main__":
