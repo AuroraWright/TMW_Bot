@@ -347,6 +347,21 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(scanned_ids), list(range(5)))
         self.assertLessEqual(maximum_active, 2)
 
+    async def test_scan_status_reports_failed_histories(self):
+        cog = MessageCountRoles(self.bot, self.settings)
+
+        async def scan_channel(_rule, channel):
+            return channel.id != 2
+
+        cog._scan_channel = scan_channel
+        status = await cog._scan_channels(
+            self.rule,
+            [SimpleNamespace(id=1), SimpleNamespace(id=2)],
+        )
+
+        self.assertEqual(status.discovered_channels, 2)
+        self.assertEqual(status.failed_channel_ids, (2,))
+
     async def test_destination_member_join_uses_loaded_count(self):
         self.cog._counts[self.rule.name][USER_ID] = self.rule.message_threshold
 

@@ -298,6 +298,22 @@ class _AwardRequest:
     started: bool = False
 
 
+@dataclass(frozen=True)
+class _ChannelDiscoveryStatus:
+    """Coverage/errors encountered while discovering source channels and threads."""
+
+    errors: int = 0
+    permission_limited: int = 0
+
+
+@dataclass(frozen=True)
+class _ScanStatus:
+    """Outcome of scanning the channels discovered for one rule."""
+
+    discovered_channels: int
+    failed_channel_ids: tuple[int, ...] = ()
+
+
 class MessageCountRoles(commands.Cog):
     """Count source-guild messages and grant roles in configured destinations."""
 
@@ -325,6 +341,7 @@ class MessageCountRoles(commands.Cog):
         self._award_sequence = 0
         self._destination_member_cache: dict[tuple[int, int], discord.Member] = {}
         self._awarded_users: set[tuple[str, int]] = set()
+        self._channel_discovery_status: dict[str, _ChannelDiscoveryStatus] = {}
         self._messages_since_flush = 0
 
     _AWARD_PRIORITY_LIVE = 0
@@ -412,6 +429,8 @@ class MessageCountRoles(commands.Cog):
     ) -> list[Any]:
         channels: list[Any] = []
         seen_channel_ids: set[int] = set()
+        discovery_errors = 0
+        permission_limited = 0
 
         def add_channel(channel: Any) -> None:
             channel_id = getattr(channel, "id", None)
@@ -445,6 +464,7 @@ class MessageCountRoles(commands.Cog):
                 discord.Forbidden,
                 discord.HTTPException,
             ) as error:
+                discovery_errors += 1
                 _log.warning(
                     "Could not refresh channels for source guild %s; using the local channel cache: %s",
                     source_guild.id,
@@ -469,6 +489,7 @@ class MessageCountRoles(commands.Cog):
                 discord.Forbidden,
                 discord.HTTPException,
             ) as error:
+                discovery_errors += 1
                 _log.warning(
                     "Could not refresh active threads for source guild %s; using the local thread cache: %s",
                     source_guild.id,
@@ -503,11 +524,19 @@ class MessageCountRoles(commands.Cog):
                         "limit": None,
                     },
                 )
+                if can_manage_threads is False:
+                    permission_limited += 1
+                    _log.debug(
+                        "Only joined private archived threads can be discovered for channel %s in guild %s because the bot lacks Manage Threads.",
+                        getattr(parent, "id", "unknown"),
+                        source_guild.id,
+                    )
             for kwargs in archive_requests:
                 try:
                     async for thread in archived_threads(**kwargs):
                         add_channel(thread)
                 except TypeError as error:
+                    discovery_errors += 1
                     _log.warning(
                         "Could not enumerate archived threads for channel %s in guild %s: %s",
                         getattr(parent, "id", "unknown"),
@@ -530,13 +559,17 @@ class MessageCountRoles(commands.Cog):
                             ):
                                 add_channel(thread)
                         except (TypeError, discord.Forbidden, discord.HTTPException) as fallback_error:
+                            discovery_errors += 1
                             _log.warning(
                                 "Could not enumerate joined private archived threads for channel %s in guild %s: %s",
                                 getattr(parent, "id", "unknown"),
                                 source_guild.id,
                                 fallback_error,
                             )
+                        else:
+                            permission_limited += 1
                         continue
+                    discovery_errors += 1
                     _log.warning(
                         "Could not enumerate %s archived threads for channel %s in guild %s: %s",
                         "private" if kwargs.get("private") else "public",
@@ -545,6 +578,7 @@ class MessageCountRoles(commands.Cog):
                         error,
                     )
                 except discord.HTTPException as error:
+                    discovery_errors += 1
                     _log.warning(
                         "Could not enumerate %s archived threads for channel %s in guild %s: %s",
                         "private" if kwargs.get("private") else "public",
@@ -553,6 +587,10 @@ class MessageCountRoles(commands.Cog):
                         error,
                     )
 
+        self._channel_discovery_status[rule.name] = _ChannelDiscoveryStatus(
+            errors=discovery_errors,
+            permission_limited=permission_limited,
+        )
         return channels
 
     def _message_is_countable(
@@ -1147,10 +1185,11 @@ class MessageCountRoles(commands.Cog):
         self,
         rule: MessageCountRoleRule,
         channel: Any,
-    ) -> None:
+    ) -> bool:
         channel_id = channel.id
         cursor = self._scan_cursors.get(rule.name, {}).get(channel_id, 0)
         latest_message_id = cursor
+        scan_succeeded = True
         messages_since_flush = 0
         history_kwargs: dict[str, Any] = {
             "limit": None,
@@ -1177,6 +1216,7 @@ class MessageCountRoles(commands.Cog):
                 if self.settings.history_batch_delay_seconds:
                     await asyncio.sleep(self.settings.history_batch_delay_seconds)
         except (discord.Forbidden, discord.HTTPException) as error:
+            scan_succeeded = False
             _log.warning(
                 "Could not scan message history for channel %s in rule %s; progress through message %s was saved: %s",
                 channel_id,
@@ -1188,17 +1228,19 @@ class MessageCountRoles(commands.Cog):
             await self._flush_dirty_counts()
             if latest_message_id != cursor:
                 await self._save_scan_cursor(rule, channel_id, latest_message_id)
+        return scan_succeeded
 
     async def _scan_channels(
         self,
         rule: MessageCountRoleRule,
         channels: list[Any],
-    ) -> None:
+    ) -> _ScanStatus:
         """Scan distinct channels concurrently with a bounded worker pool."""
         if not channels:
-            return
+            return _ScanStatus(discovered_channels=0)
 
         channel_queue: asyncio.Queue[Any] = asyncio.Queue()
+        failed_channel_ids: list[int] = []
         for channel in channels:
             channel_queue.put_nowait(channel)
 
@@ -1206,10 +1248,13 @@ class MessageCountRoles(commands.Cog):
             while True:
                 channel = await channel_queue.get()
                 try:
-                    await self._scan_channel(rule, channel)
+                    scan_succeeded = await self._scan_channel(rule, channel)
+                    if scan_succeeded is False:
+                        failed_channel_ids.append(channel.id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - keep other channels scanning
+                    failed_channel_ids.append(channel.id)
                     _log.exception(
                         "Unexpected failure while scanning channel %s for message-count role rule %s (worker=%s).",
                         getattr(channel, "id", "unknown"),
@@ -1235,6 +1280,10 @@ class MessageCountRoles(commands.Cog):
                 worker_task.cancel()
             if workers:
                 await asyncio.gather(*workers, return_exceptions=True)
+        return _ScanStatus(
+            discovered_channels=len(channels),
+            failed_channel_ids=tuple(failed_channel_ids),
+        )
 
     async def _reconcile_rule(self, rule: MessageCountRoleRule) -> None:
         source_guild = self.bot.get_guild(rule.source_guild_id)
@@ -1257,8 +1306,40 @@ class MessageCountRoles(commands.Cog):
                 rule.name,
                 min(self.settings.history_scan_worker_count, len(channels)),
             )
-            await self._scan_channels(rule, channels)
+            scan_status = await self._scan_channels(rule, channels)
             await self._flush_dirty_counts()
+
+            discovery_status = self._channel_discovery_status.get(
+                rule.name,
+                _ChannelDiscoveryStatus(),
+            )
+            if discovery_status.permission_limited:
+                _log.warning(
+                    "Message-count role source scan for rule %s has %s permission-limited private-thread parent(s); those private threads are not fully covered.",
+                    rule.name,
+                    discovery_status.permission_limited,
+                )
+            if scan_status.failed_channel_ids or discovery_status.errors:
+                _log.error(
+                    "Message-count role source scan INCOMPLETE for rule %s: discovered=%s, failed_histories=%s, discovery_errors=%s. Failed sources will be retried on the next reconciliation.",
+                    rule.name,
+                    scan_status.discovered_channels,
+                    len(scan_status.failed_channel_ids),
+                    discovery_status.errors,
+                )
+            elif discovery_status.permission_limited:
+                _log.warning(
+                    "Message-count role source scan finished with permission limitations for rule %s (discovered=%s).",
+                    rule.name,
+                    scan_status.discovered_channels,
+                )
+            else:
+                _log.info(
+                    "Message-count role source scan completed for rule %s (discovered=%s, histories=%s).",
+                    rule.name,
+                    scan_status.discovered_channels,
+                    scan_status.discovered_channels,
+                )
 
         await self._award_qualified_members(rule, destination_guild)
 
