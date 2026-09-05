@@ -55,7 +55,7 @@ class MessageCountRoleSettingsTests(unittest.TestCase):
         self.assertEqual(rule["source_guild_id"], 617136488840429598)
         self.assertEqual(rule["destination_guild_id"], 1545162007354024040)
         self.assertEqual(rule["destination_role_id"], 1545600348033384469)
-        self.assertEqual(rule["message_threshold"], 20)
+        self.assertEqual(rule["message_threshold"], 10)
         self.assertEqual(config["auto_receive_interval_minutes"], 15)
         self.assertEqual(config["award_worker_count"], 2)
         self.assertEqual(
