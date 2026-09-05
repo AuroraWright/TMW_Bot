@@ -28,8 +28,10 @@ then awards destination-guild roles when a member reaches the configured
 threshold. Rules are defined in `config/message_count_roles.yml`. Historical
 backfill and live message monitoring are enabled by default, and scan cursors
 and counts are persisted so a long initial scan can continue after a restart.
-Excluded channel IDs also exclude their child threads. A destination member
-must be present in that destination guild to receive the role.
+An independent auto-receive pass periodically retries missed grants and fetches
+destination members that are absent from the local cache. Excluded channel IDs
+also exclude their child threads. A user must be present in the destination
+guild to receive the role.
 
 ---
 

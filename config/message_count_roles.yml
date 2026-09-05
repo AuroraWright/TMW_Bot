@@ -4,10 +4,12 @@ enabled: true
 retroactive_scan: true
 monitor_new_messages: true
 reconcile_interval_minutes: 30
+auto_receive_interval_minutes: 15
 history_batch_size: 100
 history_batch_delay_seconds: 0.25
 
 rules:
+  # Keep this rule name stable so persisted counters/cursors survive threshold changes.
   - name: main_guild_50_messages
     source_guild_id: 617136488840429598
     destination_guild_id: 1545162007354024040

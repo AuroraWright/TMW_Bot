@@ -45,6 +45,11 @@ SELECT user_id, message_count
 FROM message_count_role_counts
 WHERE rule_name = ?;"""
 
+GET_MESSAGE_COUNT_FOR_USER = """
+SELECT message_count
+FROM message_count_role_counts
+WHERE rule_name = ? AND user_id = ?;"""
+
 UPSERT_MESSAGE_COUNT = """
 INSERT INTO message_count_role_counts (rule_name, user_id, message_count)
 VALUES (?, ?, ?)
@@ -145,6 +150,7 @@ class MessageCountRoleSettings:
     retroactive_scan: bool = True
     monitor_new_messages: bool = True
     reconcile_interval_minutes: float = 30.0
+    auto_receive_interval_minutes: float = 15.0
     history_batch_size: int = 100
     history_batch_delay_seconds: float = 0.25
     rules: tuple[MessageCountRoleRule, ...] = ()
@@ -183,6 +189,12 @@ class MessageCountRoleSettings:
                     cls().reconcile_interval_minutes,
                 )
             )
+            auto_receive_interval_minutes = float(
+                data.get(
+                    "auto_receive_interval_minutes",
+                    cls().auto_receive_interval_minutes,
+                )
+            )
             history_batch_delay_seconds = float(
                 data.get(
                     "history_batch_delay_seconds",
@@ -191,10 +203,13 @@ class MessageCountRoleSettings:
             )
         except (TypeError, ValueError) as error:
             raise TypeError(
-                "reconcile_interval_minutes and history_batch_delay_seconds must be numbers."
+                "reconcile_interval_minutes, auto_receive_interval_minutes, and "
+                "history_batch_delay_seconds must be numbers."
             ) from error
         if reconcile_interval_minutes <= 0:
             raise ValueError("reconcile_interval_minutes must be greater than zero.")
+        if auto_receive_interval_minutes <= 0:
+            raise ValueError("auto_receive_interval_minutes must be greater than zero.")
         if history_batch_delay_seconds < 0:
             raise ValueError("history_batch_delay_seconds cannot be negative.")
 
@@ -230,6 +245,7 @@ class MessageCountRoleSettings:
             retroactive_scan=values["retroactive_scan"],
             monitor_new_messages=values["monitor_new_messages"],
             reconcile_interval_minutes=reconcile_interval_minutes,
+            auto_receive_interval_minutes=auto_receive_interval_minutes,
             history_batch_size=history_batch_size,
             history_batch_delay_seconds=history_batch_delay_seconds,
             rules=rules,
@@ -266,6 +282,7 @@ class MessageCountRoles(commands.Cog):
         self._state_lock = asyncio.Lock()
         self._scan_lock = asyncio.Lock()
         self._award_lock = asyncio.Lock()
+        self._destination_member_cache: dict[tuple[int, int], discord.Member] = {}
         self._awarded_users: set[tuple[str, int]] = set()
         self._messages_since_flush = 0
 
@@ -290,9 +307,13 @@ class MessageCountRoles(commands.Cog):
         self.periodic_reconcile.change_interval(
             minutes=self.settings.reconcile_interval_minutes
         )
+        self.auto_receive_reconcile.change_interval(
+            minutes=self.settings.auto_receive_interval_minutes
+        )
 
     async def cog_unload(self) -> None:
         self.periodic_reconcile.cancel()
+        self.auto_receive_reconcile.cancel()
         await self._flush_dirty_counts()
 
     @staticmethod
@@ -304,13 +325,24 @@ class MessageCountRoles(commands.Cog):
         return channel_type == 15  # Discord's forum channel type.
 
     @staticmethod
+    def _is_thread_channel(channel: Any) -> bool:
+        thread_type = getattr(discord, "Thread", None)
+        if thread_type is not None and isinstance(channel, thread_type):
+            return True
+        channel_type = getattr(getattr(channel, "type", None), "value", None)
+        return channel_type in {10, 11, 12}
+
+    @classmethod
     def _is_excluded_channel(
+        cls,
         channel: Any,
         excluded_channel_ids: frozenset[int],
     ) -> bool:
         channel_id = getattr(channel, "id", None)
         parent_id = getattr(channel, "parent_id", None)
-        return channel_id in excluded_channel_ids or parent_id in excluded_channel_ids
+        return channel_id in excluded_channel_ids or (
+            cls._is_thread_channel(channel) and parent_id in excluded_channel_ids
+        )
 
     async def _message_channels(
         self,
@@ -333,19 +365,60 @@ class MessageCountRoles(commands.Cog):
             channels.append(channel)
 
         archive_parents: list[Any] = []
-        for channel in getattr(source_guild, "channels", ()):
+        archive_parent_ids: set[int] = set()
+
+        def add_archive_parent(channel: Any) -> None:
+            channel_id = getattr(channel, "id", None)
+            if channel_id is None or channel_id in archive_parent_ids:
+                return
+            archive_parent_ids.add(channel_id)
+            archive_parents.append(channel)
+
+        source_channels = list(getattr(source_guild, "channels", ()))
+        fetch_channels = getattr(source_guild, "fetch_channels", None)
+        if callable(fetch_channels):
+            try:
+                source_channels.extend(await fetch_channels())
+            except (
+                discord.ClientException,
+                discord.Forbidden,
+                discord.HTTPException,
+            ) as error:
+                _log.warning(
+                    "Could not refresh channels for source guild %s; using the local channel cache: %s",
+                    source_guild.id,
+                    error,
+                )
+
+        for channel in source_channels:
             if self._is_forum_parent(channel):
-                archive_parents.append(channel)
+                add_archive_parent(channel)
             else:
                 add_channel(channel)
                 if callable(getattr(channel, "archived_threads", None)):
-                    archive_parents.append(channel)
+                    add_archive_parent(channel)
 
-        for thread in getattr(source_guild, "threads", ()):
+        source_threads = list(getattr(source_guild, "threads", ()))
+        active_threads = getattr(source_guild, "active_threads", None)
+        if callable(active_threads):
+            try:
+                source_threads.extend(await active_threads())
+            except (
+                discord.ClientException,
+                discord.Forbidden,
+                discord.HTTPException,
+            ) as error:
+                _log.warning(
+                    "Could not refresh active threads for source guild %s; using the local thread cache: %s",
+                    source_guild.id,
+                    error,
+                )
+
+        for thread in source_threads:
             add_channel(thread)
             parent = getattr(thread, "parent", None)
-            if parent is not None and parent not in archive_parents:
-                archive_parents.append(parent)
+            if parent is not None:
+                add_archive_parent(parent)
 
         for parent in archive_parents:
             if self._is_excluded_channel(parent, rule.excluded_channel_ids):
@@ -549,28 +622,186 @@ class MessageCountRoles(commands.Cog):
         if destination_guild is None:
             return
         member = destination_guild.get_member(user_id)
+        if member is None:
+            member = self._destination_member_cache.get((destination_guild.id, user_id))
+        if member is None:
+            fetch_member = getattr(destination_guild, "fetch_member", None)
+            if callable(fetch_member):
+                try:
+                    member = await fetch_member(user_id)
+                except discord.NotFound:
+                    return
+                except (
+                    discord.ClientException,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ) as error:
+                    _log.warning(
+                        "Could not fetch destination member %s in guild %s after reaching the message-count threshold: %s",
+                        user_id,
+                        destination_guild.id,
+                        error,
+                    )
+                    return
         if member is not None:
+            self._destination_member_cache[(destination_guild.id, member.id)] = member
             await self._award_member_safely(rule, member)
+
+    async def _refresh_counts_from_database(
+        self,
+        rule: MessageCountRoleRule,
+    ) -> None:
+        """Merge persisted counts into memory before an auto-receive pass."""
+        count_rows = await self.bot.GET(GET_MESSAGE_COUNT_ROWS, (rule.name,))
+        if not count_rows:
+            return
+
+        async with self._state_lock:
+            counts = self._counts.setdefault(rule.name, {})
+            for user_id, message_count in count_rows:
+                user_id = int(user_id)
+                message_count = int(message_count)
+                if message_count > counts.get(user_id, 0):
+                    counts[user_id] = message_count
+
+    async def _refresh_count_for_user(
+        self,
+        rule: MessageCountRoleRule,
+        user_id: int,
+    ) -> int:
+        """Refresh one member's count before handling a destination join event."""
+        try:
+            row = await self.bot.GET(
+                GET_MESSAGE_COUNT_FOR_USER,
+                (rule.name, user_id),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - retain the in-memory fallback
+            _log.warning(
+                "Could not refresh message count for user %s in rule %s; using the in-memory count: %s",
+                user_id,
+                rule.name,
+                error,
+            )
+            return self._counts.get(rule.name, {}).get(user_id, 0)
+        if not row:
+            return self._counts.get(rule.name, {}).get(user_id, 0)
+
+        persisted_count = int(row[0][0])
+        async with self._state_lock:
+            current_count = self._counts.setdefault(rule.name, {}).get(user_id, 0)
+            if persisted_count > current_count:
+                self._counts[rule.name][user_id] = persisted_count
+            return max(current_count, persisted_count)
+
+    async def _get_qualified_destination_members(
+        self,
+        destination_guild: discord.Guild,
+        qualifying_user_ids: set[int],
+    ) -> list[discord.Member]:
+        """Find qualifying destination members, including members absent from cache."""
+        members_by_id = {
+            member.id: member
+            for member in getattr(destination_guild, "members", ())
+            if member.id in qualifying_user_ids
+        }
+        for member in members_by_id.values():
+            self._destination_member_cache[(destination_guild.id, member.id)] = member
+
+        for user_id in qualifying_user_ids - members_by_id.keys():
+            member = self._destination_member_cache.get((destination_guild.id, user_id))
+            if member is not None:
+                members_by_id[user_id] = member
+
+        missing_user_ids = qualifying_user_ids - members_by_id.keys()
+        if not missing_user_ids:
+            return list(members_by_id.values())
+
+        fetch_members = getattr(destination_guild, "fetch_members", None)
+        if callable(fetch_members):
+            try:
+                async for member in fetch_members(limit=None):
+                    if member is None:
+                        continue
+                    if member.id not in missing_user_ids:
+                        continue
+                    members_by_id[member.id] = member
+                    self._destination_member_cache[
+                        (destination_guild.id, member.id)
+                    ] = member
+                    missing_user_ids.discard(member.id)
+                    if not missing_user_ids:
+                        break
+            except (
+                TypeError,
+                discord.ClientException,
+                discord.Forbidden,
+                discord.HTTPException,
+            ) as error:
+                _log.warning(
+                    "Could not fetch all members in destination guild %s for message-count role backfill: %s",
+                    destination_guild.id,
+                    error,
+                )
+
+        fetch_member = getattr(destination_guild, "fetch_member", None)
+        if missing_user_ids and callable(fetch_member):
+            for user_id in tuple(missing_user_ids):
+                try:
+                    member = await fetch_member(user_id)
+                except discord.NotFound:
+                    continue
+                except (
+                    TypeError,
+                    discord.ClientException,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ) as error:
+                    _log.warning(
+                        "Could not fetch destination member %s in guild %s for message-count role backfill: %s",
+                        user_id,
+                        destination_guild.id,
+                        error,
+                    )
+                    continue
+                if member is None:
+                    continue
+                members_by_id[user_id] = member
+                self._destination_member_cache[(destination_guild.id, user_id)] = member
+
+        return list(members_by_id.values())
 
     async def _award_qualified_members(
         self,
         rule: MessageCountRoleRule,
         destination_guild: discord.Guild,
     ) -> None:
-        qualifying_user_ids = {
-            user_id
-            for user_id, message_count in self._counts.get(rule.name, {}).items()
-            if message_count >= rule.message_threshold
-        }
+        async with self._state_lock:
+            qualifying_user_ids = {
+                user_id
+                for user_id, message_count in self._counts.get(rule.name, {}).items()
+                if message_count >= rule.message_threshold
+            }
+        if not qualifying_user_ids:
+            _log.info(
+                "Message-count role backfill found no qualifying users for rule %s.",
+                rule.name,
+            )
+            return
+
+        destination_members = await self._get_qualified_destination_members(
+            destination_guild,
+            qualifying_user_ids,
+        )
         awarded_count = 0
-        for member in list(destination_guild.members):
-            if member.id not in qualifying_user_ids:
-                continue
+        for member in destination_members:
             if await self._award_member_safely(rule, member):
                 awarded_count += 1
         _log.info(
-            "Message-count role backfill checked %s qualifying members in guild %s.",
+            "Message-count role backfill processed %s of %s qualifying users in guild %s.",
             awarded_count,
+            len(qualifying_user_ids),
             destination_guild.id,
         )
 
@@ -669,6 +900,33 @@ class MessageCountRoles(commands.Cog):
     async def before_periodic_reconcile(self) -> None:
         await self.bot.wait_until_ready()
 
+    async def auto_receive_all(self) -> None:
+        """Retry all qualifying destination role grants independently of history scans."""
+        if not self.settings.enabled:
+            return
+        for rule in self.settings.rules:
+            destination_guild = self._get_destination_guild(rule)
+            if destination_guild is None:
+                continue
+            try:
+                await self._refresh_counts_from_database(rule)
+                await self._award_qualified_members(rule, destination_guild)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep other rules running
+                _log.exception(
+                    "Unexpected failure during message-count auto-receive for rule %s.",
+                    rule.name,
+                )
+
+    @tasks.loop(minutes=15)
+    async def auto_receive_reconcile(self) -> None:
+        await self.auto_receive_all()
+
+    @auto_receive_reconcile.before_loop
+    async def before_auto_receive_reconcile(self) -> None:
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_ready(self) -> None:
         if (
@@ -677,6 +935,12 @@ class MessageCountRoles(commands.Cog):
             and not self.periodic_reconcile.is_running()
         ):
             self.periodic_reconcile.start()
+        if (
+            self.settings.enabled
+            and self.settings.rules
+            and not self.auto_receive_reconcile.is_running()
+        ):
+            self.auto_receive_reconcile.start()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -704,8 +968,9 @@ class MessageCountRoles(commands.Cog):
         for rule in self.settings.rules:
             if member.guild.id != rule.destination_guild_id:
                 continue
+            self._destination_member_cache[(member.guild.id, member.id)] = member
             if (
-                self._counts.get(rule.name, {}).get(member.id, 0)
+                await self._refresh_count_for_user(rule, member.id)
                 >= rule.message_threshold
             ):
                 await self._award_member_safely(rule, member)
@@ -721,6 +986,7 @@ class MessageCountRoles(commands.Cog):
         for rule in self.settings.rules:
             if after.guild.id != rule.destination_guild_id:
                 continue
+            self._destination_member_cache[(after.guild.id, after.id)] = after
             if not any(
                 existing_role.id == rule.destination_role_id
                 for existing_role in after.roles
@@ -731,6 +997,14 @@ class MessageCountRoles(commands.Cog):
                 >= rule.message_threshold
             ):
                 await self._award_member_safely(rule, after)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        for rule in self.settings.rules:
+            if member.guild.id != rule.destination_guild_id:
+                continue
+            self._destination_member_cache.pop((member.guild.id, member.id), None)
+            self._awarded_users.discard((rule.name, member.id))
 
 
 async def setup(bot: TMWBot) -> None:

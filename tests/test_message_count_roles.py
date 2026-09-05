@@ -55,6 +55,7 @@ class MessageCountRoleSettingsTests(unittest.TestCase):
         self.assertEqual(rule["destination_guild_id"], 1545162007354024040)
         self.assertEqual(rule["destination_role_id"], 1545600348033384469)
         self.assertEqual(rule["message_threshold"], 20)
+        self.assertEqual(config["auto_receive_interval_minutes"], 15)
         self.assertEqual(
             rule["excluded_channel_ids"],
             [1027706916874506311, 1345775806399647907, 814947177608118273],
@@ -141,9 +142,33 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.cog._counts[self.rule.name][USER_ID], 2)
 
+    async def test_live_threshold_fetches_destination_member_when_cache_misses(self):
+        uncached_member = SimpleNamespace(
+            id=USER_ID,
+            bot=False,
+            guild=self.destination_guild,
+            roles=[],
+            add_roles=AsyncMock(),
+        )
+        self.destination_guild.get_member.return_value = None
+        self.destination_guild.fetch_member = AsyncMock(return_value=uncached_member)
+        channel = SimpleNamespace(id=10, parent_id=None)
+
+        await self.cog.on_message(make_message(1, channel))
+        await self.cog.on_message(make_message(2, channel))
+
+        uncached_member.add_roles.assert_awaited_once_with(
+            self.destination_role,
+            reason="Reached the configured message-count role threshold",
+        )
+
     async def test_excluded_channels_threads_and_bot_messages_do_not_count(self):
         excluded_channel = SimpleNamespace(id=99, parent_id=None)
-        excluded_thread = SimpleNamespace(id=100, parent_id=99)
+        excluded_thread = SimpleNamespace(
+            id=100,
+            parent_id=99,
+            type=SimpleNamespace(value=11),
+        )
         normal_channel = SimpleNamespace(id=10, parent_id=None)
 
         await self.cog.on_message(make_message(1, excluded_channel))
@@ -152,6 +177,18 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(USER_ID, self.cog._counts[self.rule.name])
         self.destination_member.add_roles.assert_not_awaited()
+
+    async def test_channel_under_an_excluded_category_is_not_excluded(self):
+        channel = SimpleNamespace(
+            id=10,
+            parent_id=99,
+            type=SimpleNamespace(value=0),
+        )
+
+        for message_id in (1, 2):
+            await self.cog.on_message(make_message(message_id, channel))
+
+        self.destination_member.add_roles.assert_awaited_once()
 
     async def test_retroactive_scan_backfills_existing_destination_members(self):
         channel = make_history_channel(
@@ -198,6 +235,18 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
 
         self.destination_member.add_roles.assert_awaited_once()
 
+    async def test_channel_discovery_refreshes_the_source_guild_cache(self):
+        refreshed_channel = make_history_channel(40, [])
+
+        async def fetch_channels():
+            return [refreshed_channel]
+
+        self.source_guild.fetch_channels = fetch_channels
+
+        channels = await self.cog._message_channels(self.rule, self.source_guild)
+
+        self.assertEqual([channel.id for channel in channels], [40])
+
     async def test_scan_resumes_after_saved_cursor(self):
         history_calls = []
         messages = [make_message(3, SimpleNamespace(id=10, parent_id=None))]
@@ -221,6 +270,41 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         await self.cog.on_member_join(self.destination_member)
 
         self.destination_member.add_roles.assert_awaited_once()
+
+    async def test_destination_member_join_refreshes_persisted_count(self):
+        self.bot.GET.return_value = [(self.rule.message_threshold,)]
+
+        await self.cog.on_member_join(self.destination_member)
+
+        self.destination_member.add_roles.assert_awaited_once()
+        self.assertEqual(
+            self.cog._counts[self.rule.name][USER_ID],
+            self.rule.message_threshold,
+        )
+
+    async def test_auto_receive_fetches_members_missing_from_destination_cache(self):
+        uncached_member = SimpleNamespace(
+            id=USER_ID,
+            bot=False,
+            guild=self.destination_guild,
+            roles=[],
+            add_roles=AsyncMock(),
+        )
+        self.destination_guild.members = []
+
+        async def fetch_members(*, limit):
+            self.assertIsNone(limit)
+            yield uncached_member
+
+        self.destination_guild.fetch_members = fetch_members
+        self.cog._counts[self.rule.name][USER_ID] = self.rule.message_threshold
+
+        await self.cog.auto_receive_all()
+
+        uncached_member.add_roles.assert_awaited_once_with(
+            self.destination_role,
+            reason="Reached the configured message-count role threshold",
+        )
 
 
 if __name__ == "__main__":
