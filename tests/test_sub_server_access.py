@@ -139,6 +139,21 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
         self.sub_guild.kick.assert_not_awaited()
 
+    async def test_exemption_user_bypasses_missing_required_role_kick(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            required_role_ids_by_sub_guild={SUB_GUILD_ID: (10,)},
+            exempt_user_ids_by_sub_guild={SUB_GUILD_ID: (USER_ID,)},
+        )
+        self.cog._get_access_status = AsyncMock(
+            return_value=AccessStatus.MISSING_REQUIRED_ROLE
+        )
+
+        await self.cog._enforce_sub_member(self.make_sub_member())
+
+        self.sub_guild.kick.assert_not_awaited()
+
     async def test_sub_server_join_without_main_membership_is_kicked(self):
         self.cog._get_access_status = AsyncMock(
             return_value=AccessStatus.NOT_IN_MAIN_GUILD
@@ -179,6 +194,17 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
             id=USER_ID,
             guild=self.sub_guild,
             roles=[make_role(20, 1)],
+        )
+
+        await self.cog.on_member_remove(self.make_main_member([]))
+
+        self.sub_guild.kick.assert_not_awaited()
+
+    async def test_leaving_main_server_preserves_exempt_user_without_member_cache(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            exempt_user_ids_by_sub_guild={SUB_GUILD_ID: (USER_ID,)},
         )
 
         await self.cog.on_member_remove(self.make_main_member([]))
@@ -298,12 +324,14 @@ class SubServerSettingsTests(unittest.TestCase):
                 "sub_guild_ids": [2, 3],
                 "required_role_ids": {"3": [10]},
                 "exempt_role_ids": {3: 20},
+                "exempt_user_ids": {3: [30, 31]},
                 "mirrored_sub_guild_ids": [2],
             }
         )
 
         self.assertEqual(settings.required_role_ids_for(3), (10,))
         self.assertEqual(settings.exempt_role_ids_for(3), (20,))
+        self.assertEqual(settings.exempt_user_ids_for(3), (30, 31))
         self.assertEqual(settings.mirror_guild_ids, (2,))
 
     def test_duplicate_sub_server_ids_are_removed(self):

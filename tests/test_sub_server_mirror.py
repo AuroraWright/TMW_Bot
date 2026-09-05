@@ -72,6 +72,10 @@ class MirrorSettingsTests(unittest.TestCase):
             config["exempt_role_ids"][1545162007354024040],
             [1545393232442163310],
         )
+        self.assertEqual(
+            config["exempt_user_ids"][1545162007354024040],
+            [1539607227873361971],
+        )
         self.assertNotIn("required_role_id", config)
         self.assertTrue(config["mirror"]["enabled"])
         self.assertTrue(config["mirror"]["delete_unmapped_roles"])

@@ -19,6 +19,12 @@ exempt_role_ids:
   1545162007354024040:
     - 1545393232442163310
 
+# These user IDs bypass kicks for unmet membership/required-role checks.
+# Main-server ban enforcement still applies to listed users.
+exempt_user_ids:
+  1545162007354024040:
+    - 1539607227873361971
+
 # Structural mirroring can be limited to a subset of access-controlled
 # sub-servers. The new message-achievement server is intentionally access-only.
 mirrored_sub_guild_ids:

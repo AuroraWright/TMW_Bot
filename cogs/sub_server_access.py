@@ -46,18 +46,21 @@ FROM sub_server_mirrored_bans
 WHERE main_guild_id = ? AND sub_guild_id = ? AND user_id = ?;"""
 
 
-def _parse_sub_guild_role_ids(
-    configured_role_map: Any,
+def _parse_sub_guild_id_map(
+    configured_id_map: Any,
     sub_guild_ids: tuple[int, ...],
     setting_name: str,
+    id_kind: str,
 ) -> dict[int, tuple[int, ...]]:
-    if configured_role_map is None:
+    if configured_id_map is None:
         return {}
-    if not isinstance(configured_role_map, dict):
-        raise TypeError(f"{setting_name} must be a mapping of guild IDs to role IDs.")
+    if not isinstance(configured_id_map, dict):
+        raise TypeError(
+            f"{setting_name} must be a mapping of guild IDs to {id_kind} IDs."
+        )
 
     parsed: dict[int, tuple[int, ...]] = {}
-    for configured_guild_id, configured_role_ids in configured_role_map.items():
+    for configured_guild_id, configured_ids in configured_id_map.items():
         try:
             guild_id = int(configured_guild_id)
         except (TypeError, ValueError) as error:
@@ -69,22 +72,20 @@ def _parse_sub_guild_role_ids(
                 f"{setting_name} contains unconfigured sub-server {guild_id}."
             )
 
-        role_values = (
-            configured_role_ids
-            if isinstance(configured_role_ids, list)
-            else [configured_role_ids]
+        id_values = (
+            configured_ids if isinstance(configured_ids, list) else [configured_ids]
         )
         try:
-            role_ids = tuple(dict.fromkeys(int(role_id) for role_id in role_values))
+            parsed_ids = tuple(dict.fromkeys(int(value) for value in id_values))
         except (TypeError, ValueError) as error:
             raise ValueError(
-                f"{setting_name} must contain integer Discord role IDs."
+                f"{setting_name} must contain integer Discord {id_kind} IDs."
             ) from error
-        if not role_ids:
+        if not parsed_ids:
             raise ValueError(
                 f"{setting_name} for sub-server {guild_id} cannot be empty."
             )
-        parsed[guild_id] = role_ids
+        parsed[guild_id] = parsed_ids
 
     return parsed
 
@@ -96,6 +97,7 @@ class SubServerSettings:
     required_role_ids_by_sub_guild: dict[int, tuple[int, ...]] | None = None
     exempt_role_ids_by_sub_guild: dict[int, tuple[int, ...]] | None = None
     mirrored_sub_guild_ids: tuple[int, ...] | None = None
+    exempt_user_ids_by_sub_guild: dict[int, tuple[int, ...]] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "SubServerSettings":
@@ -121,15 +123,23 @@ class SubServerSettings:
         if main_guild_id in sub_guild_ids:
             raise ValueError("The main guild cannot also be a sub-server.")
 
-        required_role_ids_by_sub_guild = _parse_sub_guild_role_ids(
+        required_role_ids_by_sub_guild = _parse_sub_guild_id_map(
             data.get("required_role_ids"),
             sub_guild_ids,
             "required_role_ids",
+            "role",
         )
-        exempt_role_ids_by_sub_guild = _parse_sub_guild_role_ids(
+        exempt_role_ids_by_sub_guild = _parse_sub_guild_id_map(
             data.get("exempt_role_ids"),
             sub_guild_ids,
             "exempt_role_ids",
+            "role",
+        )
+        exempt_user_ids_by_sub_guild = _parse_sub_guild_id_map(
+            data.get("exempt_user_ids"),
+            sub_guild_ids,
+            "exempt_user_ids",
+            "user",
         )
 
         mirrored_ids_data = data.get("mirrored_sub_guild_ids")
@@ -159,6 +169,7 @@ class SubServerSettings:
             sub_guild_ids=sub_guild_ids,
             required_role_ids_by_sub_guild=required_role_ids_by_sub_guild,
             exempt_role_ids_by_sub_guild=exempt_role_ids_by_sub_guild,
+            exempt_user_ids_by_sub_guild=exempt_user_ids_by_sub_guild,
             mirrored_sub_guild_ids=mirrored_sub_guild_ids,
         )
 
@@ -178,6 +189,9 @@ class SubServerSettings:
 
     def exempt_role_ids_for(self, sub_guild_id: int) -> tuple[int, ...]:
         return (self.exempt_role_ids_by_sub_guild or {}).get(sub_guild_id, ())
+
+    def exempt_user_ids_for(self, sub_guild_id: int) -> tuple[int, ...]:
+        return (self.exempt_user_ids_by_sub_guild or {}).get(sub_guild_id, ())
 
 
 def load_sub_server_settings(path: Path) -> SubServerSettings:
@@ -228,7 +242,10 @@ class SubServerAccess(commands.Cog):
         return self.bot.user is not None and user_id == self.bot.user.id
 
     def _has_access_exemption(self, member: discord.Member) -> bool:
-        exempt_role_ids = self.settings.exempt_role_ids_for(member.guild.id)
+        sub_guild_id = member.guild.id
+        if member.id in self.settings.exempt_user_ids_for(sub_guild_id):
+            return True
+        exempt_role_ids = self.settings.exempt_role_ids_for(sub_guild_id)
         return any(role.id in exempt_role_ids for role in getattr(member, "roles", ()))
 
     async def _get_access_status(
@@ -557,8 +574,9 @@ class SubServerAccess(commands.Cog):
                 if callable(get_destination_member)
                 else None
             )
-            if destination_member is not None and self._has_access_exemption(
-                destination_member
+            if member.id in self.settings.exempt_user_ids_for(sub_guild.id) or (
+                destination_member is not None
+                and self._has_access_exemption(destination_member)
             ):
                 _log.info(
                     "Allowing member %s to remain in sub-server %s because of an access exemption role.",
