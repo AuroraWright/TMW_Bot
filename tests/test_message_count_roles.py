@@ -250,6 +250,17 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([channel.id for channel in channels], [40])
 
+    async def test_recently_active_channels_are_scanned_first(self):
+        older_channel = make_history_channel(41, [])
+        older_channel.last_message_id = 100
+        newer_channel = make_history_channel(42, [])
+        newer_channel.last_message_id = 200
+        self.source_guild.channels = [older_channel, newer_channel]
+
+        channels = await self.cog._message_channels(self.rule, self.source_guild)
+
+        self.assertEqual([channel.id for channel in channels], [42, 41])
+
     async def test_all_private_archived_threads_are_discovered_with_manage_threads(self):
         calls = []
         public_thread = make_history_channel(
@@ -317,6 +328,35 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history_calls[0]["after"].id, 2)
         self.assertEqual(self.cog._scan_cursors[self.rule.name][channel.id], 3)
 
+    async def test_channel_scan_processes_multiple_pages_and_resumes(self):
+        history_calls = []
+        message_channel = SimpleNamespace(id=10, parent_id=None)
+        messages = [
+            make_message(1, message_channel),
+            make_message(2, message_channel),
+            make_message(3, message_channel),
+        ]
+
+        async def history(**kwargs):
+            history_calls.append(kwargs)
+            after_id = getattr(kwargs.get("after"), "id", 0)
+            limit = kwargs["limit"]
+            for message in messages:
+                if message.id > after_id:
+                    yield message
+                    limit -= 1
+                    if limit == 0:
+                        break
+
+        channel = SimpleNamespace(id=10, history=history)
+
+        self.assertTrue(await self.cog._scan_channel(self.rule, channel))
+
+        self.assertEqual(len(history_calls), 2)
+        self.assertNotIn("after", history_calls[0])
+        self.assertEqual(history_calls[1]["after"].id, 2)
+        self.assertEqual(self.cog._scan_cursors[self.rule.name][channel.id], 3)
+
     async def test_channel_scans_are_bounded_by_scan_worker_count(self):
         settings = MessageCountRoleSettings(
             enabled=True,
@@ -331,15 +371,16 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         maximum_active = 0
         scanned_ids = []
 
-        async def scan_channel(_rule, channel):
+        async def scan_channel_page(_rule, channel):
             nonlocal active, maximum_active
             active += 1
             maximum_active = max(maximum_active, active)
             scanned_ids.append(channel.id)
             await asyncio.sleep(0)
             active -= 1
+            return True, False
 
-        cog._scan_channel = scan_channel
+        cog._scan_channel_page = scan_channel_page
         channels = [SimpleNamespace(id=index) for index in range(5)]
 
         await cog._scan_channels(self.rule, channels)
@@ -350,10 +391,10 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
     async def test_scan_status_reports_failed_histories(self):
         cog = MessageCountRoles(self.bot, self.settings)
 
-        async def scan_channel(_rule, channel):
-            return channel.id != 2
+        async def scan_channel_page(_rule, channel):
+            return channel.id != 2, False
 
-        cog._scan_channel = scan_channel
+        cog._scan_channel_page = scan_channel_page
         status = await cog._scan_channels(
             self.rule,
             [SimpleNamespace(id=1), SimpleNamespace(id=2)],
@@ -362,12 +403,53 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status.discovered_channels, 2)
         self.assertEqual(status.failed_channel_ids, (2,))
 
+    async def test_channel_pages_are_fairly_requeued(self):
+        cog = MessageCountRoles(self.bot, self.settings)
+        calls = []
+        remaining_pages = {1: 2, 2: 1, 3: 1}
+
+        async def scan_channel_page(_rule, channel):
+            calls.append(channel.id)
+            remaining_pages[channel.id] -= 1
+            return True, remaining_pages[channel.id] > 0
+
+        cog._scan_channel_page = scan_channel_page
+        await cog._scan_channels(
+            self.rule,
+            [SimpleNamespace(id=1), SimpleNamespace(id=2), SimpleNamespace(id=3)],
+        )
+
+        self.assertEqual(calls, [1, 2, 3, 1])
+
     async def test_destination_member_join_uses_loaded_count(self):
         self.cog._counts[self.rule.name][USER_ID] = self.rule.message_threshold
 
         await self.cog.on_member_join(self.destination_member)
 
         self.destination_member.add_roles.assert_awaited_once()
+
+    async def test_destination_member_join_is_rechecked_after_provisional_count(self):
+        await self.cog.on_member_join(self.destination_member)
+
+        pending_key = (self.rule.name, USER_ID)
+        self.assertIn(pending_key, self.cog._pending_member_checks)
+        self.cog._counts[self.rule.name][USER_ID] = self.rule.message_threshold
+
+        await self.cog._retry_pending_member_checks(
+            self.rule,
+            self.destination_guild,
+        )
+
+        self.destination_member.add_roles.assert_awaited_once()
+        self.assertNotIn(pending_key, self.cog._pending_member_checks)
+
+    async def test_join_with_existing_role_is_not_left_pending(self):
+        self.destination_member.roles = [self.destination_role]
+
+        await self.cog.on_member_join(self.destination_member)
+
+        self.assertEqual(self.cog._pending_member_checks, {})
+        self.destination_member.add_roles.assert_not_awaited()
 
     async def test_history_threshold_queues_without_waiting_for_role_api(self):
         settings = MessageCountRoleSettings(

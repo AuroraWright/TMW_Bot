@@ -341,6 +341,8 @@ class MessageCountRoles(commands.Cog):
         self._award_sequence = 0
         self._destination_member_cache: dict[tuple[int, int], discord.Member] = {}
         self._awarded_users: set[tuple[str, int]] = set()
+        self._pending_member_checks: dict[tuple[str, int], discord.Member] = {}
+        self._source_scans_in_progress: set[str] = set()
         self._channel_discovery_status: dict[str, _ChannelDiscoveryStatus] = {}
         self._messages_since_flush = 0
 
@@ -421,6 +423,17 @@ class MessageCountRoles(commands.Cog):
         except Exception:  # noqa: BLE001 - permission lookup is best effort
             return None
         return bool(getattr(permissions, "manage_threads", False))
+
+    @staticmethod
+    def _channel_activity_key(channel: Any) -> tuple[int, int]:
+        """Return a stable key that puts recently active channels first."""
+        last_message_id = getattr(channel, "last_message_id", None)
+        if last_message_id is None:
+            return (0, 0)
+        try:
+            return (1, int(last_message_id))
+        except (TypeError, ValueError):
+            return (0, 0)
 
     async def _message_channels(
         self,
@@ -591,6 +604,10 @@ class MessageCountRoles(commands.Cog):
             errors=discovery_errors,
             permission_limited=permission_limited,
         )
+        # A fair, recent-first order means active channels and new threads are
+        # checked before the large historical backlog.  The stable fallback
+        # preserves the guild/API order when activity metadata is unavailable.
+        channels.sort(key=self._channel_activity_key, reverse=True)
         return channels
 
     def _message_is_countable(
@@ -1181,18 +1198,63 @@ class MessageCountRoles(commands.Cog):
             destination_guild.id,
         )
 
-    async def _scan_channel(
+    async def _retry_pending_member_checks(
+        self,
+        rule: MessageCountRoleRule,
+        destination_guild: discord.Guild,
+    ) -> None:
+        """Retry join checks whose count was provisional during a source scan."""
+        pending_members = [
+            (key, member)
+            for key, member in self._pending_member_checks.items()
+            if key[0] == rule.name
+        ]
+        if not pending_members:
+            return
+
+        async with self._state_lock:
+            counts = self._counts.get(rule.name, {})
+            qualifying = [
+                (key, member)
+                for key, member in pending_members
+                if counts.get(member.id, 0) >= rule.message_threshold
+        ]
+
+        for key, member in qualifying:
+            if self._pending_member_checks.get(key) is not member:
+                continue
+            result = await self._award_member_safely(
+                rule,
+                member,
+                priority=self._AWARD_PRIORITY_LIVE,
+                source="pending-member-recheck",
+            )
+            if result:
+                self._pending_member_checks.pop(key, None)
+
+        still_pending = len(pending_members) - len(qualifying)
+        if qualifying:
+            _log.info(
+                "Retried pending message-count checks for rule %s: qualifying=%s, still_pending=%s, destination_guild=%s.",
+                rule.name,
+                len(qualifying),
+                still_pending,
+                destination_guild.id,
+            )
+
+    async def _scan_channel_page(
         self,
         rule: MessageCountRoleRule,
         channel: Any,
-    ) -> bool:
+    ) -> tuple[bool, bool]:
+        """Scan one bounded history page and report whether another is needed."""
         channel_id = channel.id
         cursor = self._scan_cursors.get(rule.name, {}).get(channel_id, 0)
         latest_message_id = cursor
-        scan_succeeded = True
-        messages_since_flush = 0
+        new_messages_seen = 0
+        page_size = min(self.settings.history_batch_size, 100)
         history_kwargs: dict[str, Any] = {
-            "limit": None,
+            "limit": page_size,
             "oldest_first": True,
         }
         if cursor:
@@ -1207,16 +1269,12 @@ class MessageCountRoles(commands.Cog):
                     latest_message_id
                 )
                 await self._record_message(rule, message, from_history=True)
-                messages_since_flush += 1
-                if messages_since_flush < self.settings.history_batch_size:
-                    continue
-                await self._flush_dirty_counts()
-                await self._save_scan_cursor(rule, channel_id, latest_message_id)
-                messages_since_flush = 0
-                if self.settings.history_batch_delay_seconds:
-                    await asyncio.sleep(self.settings.history_batch_delay_seconds)
+                new_messages_seen += 1
+                # A defensive bound keeps test doubles and non-conforming
+                # clients from making one page consume an unbounded stream.
+                if new_messages_seen >= page_size:
+                    break
         except (discord.Forbidden, discord.HTTPException) as error:
-            scan_succeeded = False
             _log.warning(
                 "Could not scan message history for channel %s in rule %s; progress through message %s was saved: %s",
                 channel_id,
@@ -1224,11 +1282,29 @@ class MessageCountRoles(commands.Cog):
                 latest_message_id,
                 error,
             )
+            return False, False
         finally:
             await self._flush_dirty_counts()
             if latest_message_id != cursor:
                 await self._save_scan_cursor(rule, channel_id, latest_message_id)
-        return scan_succeeded
+
+        has_more = new_messages_seen >= page_size
+        if has_more and self.settings.history_batch_delay_seconds:
+            await asyncio.sleep(self.settings.history_batch_delay_seconds)
+        return True, has_more
+
+    async def _scan_channel(
+        self,
+        rule: MessageCountRoleRule,
+        channel: Any,
+    ) -> bool:
+        """Scan a channel to completion, one bounded page at a time."""
+        while True:
+            scan_succeeded, has_more = await self._scan_channel_page(rule, channel)
+            if not scan_succeeded:
+                return False
+            if not has_more:
+                return True
 
     async def _scan_channels(
         self,
@@ -1248,9 +1324,16 @@ class MessageCountRoles(commands.Cog):
             while True:
                 channel = await channel_queue.get()
                 try:
-                    scan_succeeded = await self._scan_channel(rule, channel)
-                    if scan_succeeded is False:
+                    scan_succeeded, has_more = await self._scan_channel_page(
+                        rule,
+                        channel,
+                    )
+                    if not scan_succeeded:
                         failed_channel_ids.append(channel.id)
+                    elif has_more:
+                        # Requeue after one page so a large old channel cannot
+                        # starve recently active channels and threads.
+                        channel_queue.put_nowait(channel)
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 - keep other channels scanning
@@ -1299,49 +1382,54 @@ class MessageCountRoles(commands.Cog):
             return
 
         if self.settings.retroactive_scan:
-            channels = await self._message_channels(rule, source_guild)
-            _log.info(
-                "Scanning %s message channels for message-count role rule %s with %s workers.",
-                len(channels),
-                rule.name,
-                min(self.settings.history_scan_worker_count, len(channels)),
-            )
-            scan_status = await self._scan_channels(rule, channels)
-            await self._flush_dirty_counts()
-
-            discovery_status = self._channel_discovery_status.get(
-                rule.name,
-                _ChannelDiscoveryStatus(),
-            )
-            if discovery_status.permission_limited:
-                _log.warning(
-                    "Message-count role source scan for rule %s has %s permission-limited private-thread parent(s); those private threads are not fully covered.",
-                    rule.name,
-                    discovery_status.permission_limited,
-                )
-            if scan_status.failed_channel_ids or discovery_status.errors:
-                _log.error(
-                    "Message-count role source scan INCOMPLETE for rule %s: discovered=%s, failed_histories=%s, discovery_errors=%s. Failed sources will be retried on the next reconciliation.",
-                    rule.name,
-                    scan_status.discovered_channels,
-                    len(scan_status.failed_channel_ids),
-                    discovery_status.errors,
-                )
-            elif discovery_status.permission_limited:
-                _log.warning(
-                    "Message-count role source scan finished with permission limitations for rule %s (discovered=%s).",
-                    rule.name,
-                    scan_status.discovered_channels,
-                )
-            else:
+            self._source_scans_in_progress.add(rule.name)
+            try:
+                channels = await self._message_channels(rule, source_guild)
                 _log.info(
-                    "Message-count role source scan completed for rule %s (discovered=%s, histories=%s).",
+                    "Scanning %s message channels for message-count role rule %s with %s workers (recent activity first).",
+                    len(channels),
                     rule.name,
-                    scan_status.discovered_channels,
-                    scan_status.discovered_channels,
+                    min(self.settings.history_scan_worker_count, len(channels)),
                 )
+                scan_status = await self._scan_channels(rule, channels)
+                await self._flush_dirty_counts()
+
+                discovery_status = self._channel_discovery_status.get(
+                    rule.name,
+                    _ChannelDiscoveryStatus(),
+                )
+                if discovery_status.permission_limited:
+                    _log.warning(
+                        "Message-count role source scan for rule %s has %s permission-limited private-thread parent(s); those private threads are not fully covered.",
+                        rule.name,
+                        discovery_status.permission_limited,
+                    )
+                if scan_status.failed_channel_ids or discovery_status.errors:
+                    _log.error(
+                        "Message-count role source scan INCOMPLETE for rule %s: discovered=%s, failed_histories=%s, discovery_errors=%s. Failed sources will be retried on the next reconciliation.",
+                        rule.name,
+                        scan_status.discovered_channels,
+                        len(scan_status.failed_channel_ids),
+                        discovery_status.errors,
+                    )
+                elif discovery_status.permission_limited:
+                    _log.warning(
+                        "Message-count role source scan finished with permission limitations for rule %s (discovered=%s).",
+                        rule.name,
+                        scan_status.discovered_channels,
+                    )
+                else:
+                    _log.info(
+                        "Message-count role source scan completed for rule %s (discovered=%s, histories=%s).",
+                        rule.name,
+                        scan_status.discovered_channels,
+                        scan_status.discovered_channels,
+                    )
+            finally:
+                self._source_scans_in_progress.discard(rule.name)
 
         await self._award_qualified_members(rule, destination_guild)
+        await self._retry_pending_member_checks(rule, destination_guild)
 
     async def reconcile_all(self) -> None:
         if not self.settings.enabled:
@@ -1377,6 +1465,7 @@ class MessageCountRoles(commands.Cog):
             try:
                 await self._refresh_counts_from_database(rule)
                 await self._award_qualified_members(rule, destination_guild)
+                await self._retry_pending_member_checks(rule, destination_guild)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - keep other rules running
@@ -1450,12 +1539,28 @@ class MessageCountRoles(commands.Cog):
                 rule.message_threshold,
                 max(0.0, time.monotonic() - lookup_started_at),
             )
+            if any(
+                existing_role.id == rule.destination_role_id
+                for existing_role in member.roles
+            ):
+                self._pending_member_checks.pop((rule.name, member.id), None)
+                continue
             if message_count >= rule.message_threshold:
+                self._pending_member_checks.pop((rule.name, member.id), None)
                 await self._award_member_safely(
                     rule,
                     member,
                     priority=self._AWARD_PRIORITY_LIVE,
                     source="member-join",
+                )
+            else:
+                self._pending_member_checks[(rule.name, member.id)] = member
+                _log.info(
+                    "Deferred message-count role decision for member %s in rule %s (indexed_count=%s, source_scan_in_progress=%s); the member will be rechecked on the next indexing pass.",
+                    member.id,
+                    rule.name,
+                    message_count,
+                    rule.name in self._source_scans_in_progress,
                 )
 
     @commands.Cog.listener()
@@ -1475,16 +1580,19 @@ class MessageCountRoles(commands.Cog):
                 for existing_role in after.roles
             ):
                 self._awarded_users.discard((rule.name, after.id))
+                self._pending_member_checks[(rule.name, after.id)] = after
             if (
                 self._counts.get(rule.name, {}).get(after.id, 0)
                 >= rule.message_threshold
             ):
-                await self._award_member_safely(
+                award_succeeded = await self._award_member_safely(
                     rule,
                     after,
                     priority=self._AWARD_PRIORITY_LIVE,
                     source="member-update",
                 )
+                if award_succeeded:
+                    self._pending_member_checks.pop((rule.name, after.id), None)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member) -> None:
@@ -1493,6 +1601,7 @@ class MessageCountRoles(commands.Cog):
                 continue
             self._destination_member_cache.pop((member.guild.id, member.id), None)
             self._awarded_users.discard((rule.name, member.id))
+            self._pending_member_checks.pop((rule.name, member.id), None)
 
 
 async def setup(bot: TMWBot) -> None:

@@ -34,9 +34,13 @@ also exclude their child threads. A user must be present in the destination
 guild to receive the role. Role awards are deduplicated through a bounded
 priority queue: live joins and threshold crossings are handled before
 lower-priority historical backfill. Independent channel and thread histories
-are scanned with a separate bounded worker pool, and historical threshold
-crossings are submitted to the backfill queue immediately. The worker counts
-are configurable with `history_scan_worker_count` and `award_worker_count` in
+are scanned with a separate bounded worker pool. Histories are processed in
+bounded pages, with recently active channels/threads serviced first so a large
+old channel cannot starve newer activity. Join-time counts are provisional
+while a source scan is in progress; those members are kept pending and
+rechecked as indexing advances. Historical threshold crossings are submitted
+to the backfill queue immediately. The worker counts are configurable with
+`history_scan_worker_count` and `award_worker_count` in
 `config/message_count_roles.yml` (keep them conservative to avoid Discord rate
 limits).
 
