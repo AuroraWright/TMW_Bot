@@ -56,7 +56,22 @@ class MirrorSettingsTests(unittest.TestCase):
         )
 
         self.assertEqual(config["main_guild_id"], 617136488840429598)
-        self.assertEqual(config["sub_guild_ids"], [1545132788997427260])
+        self.assertEqual(
+            config["sub_guild_ids"],
+            [1545132788997427260, 1545162007354024040],
+        )
+        self.assertEqual(
+            config["mirrored_sub_guild_ids"],
+            [1545132788997427260],
+        )
+        self.assertEqual(
+            config["required_role_ids"][1545162007354024040],
+            [1301694741083328565],
+        )
+        self.assertEqual(
+            config["exempt_role_ids"][1545162007354024040],
+            [1545393232442163310],
+        )
         self.assertNotIn("required_role_id", config)
         self.assertTrue(config["mirror"]["enabled"])
         self.assertTrue(config["mirror"]["delete_unmapped_roles"])

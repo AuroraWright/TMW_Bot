@@ -21,6 +21,18 @@ All commands here require administrator permissions by default.
 
 ---
 
+#### `message_count_roles.py`
+
+Counts human-authored messages in configured source-guild channels and threads,
+then awards destination-guild roles when a member reaches the configured
+threshold. Rules are defined in `config/message_count_roles.yml`. Historical
+backfill and live message monitoring are enabled by default, and scan cursors
+and counts are persisted so a long initial scan can continue after a restart.
+Excluded channel IDs also exclude their child threads. A destination member
+must be present in that destination guild to receive the role.
+
+---
+
 #### `bookmark.py`
 
 Lets users bookmark messages by reacting with 🔖. Bookmarked messages are sent to the user's DMs and can be removed with ❌. Also tracks most bookmarked messages per server.
@@ -185,7 +197,7 @@ Note: Requires configuration in `selfmute_settings.yml` to define mute roles and
 
 #### `sub_server_access.py`
 
-Restricts configured sub-servers to members who are still in the main server. Ineligible users are kicked immediately, and main-server bans and unbans are mirrored to every sub-server. Mirrored bans are tracked so offline unbans can be repaired at startup without removing unrelated sub-server bans. Existing members are also checked whenever the bot starts.
+Restricts configured sub-servers to members who are still in the main server. Per-sub-server required roles and access-exemption roles can be configured in `config/sub_server_settings.yml`. Ineligible users are kicked immediately, and main-server bans and unbans are mirrored to every access-controlled sub-server. Mirrored bans are tracked so offline unbans can be repaired at startup without removing unrelated sub-server bans. Existing members are also checked whenever the bot starts. Structural mirroring can be limited to a subset with `mirrored_sub_guild_ids`.
 
 No user commands - fully automatic. Server IDs are defined in `config/sub_server_settings.yml`. The bot needs the Server Members intent, Ban Members in the main server (to identify existing bans), and Kick Members and Ban Members in each sub-server.
 

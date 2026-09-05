@@ -4,6 +4,25 @@ main_guild_id: 617136488840429598
 # Add one or more sub-server IDs here.
 sub_guild_ids:
   - 1545132788997427260
+  - 1545162007354024040
+
+# Optional access requirements, keyed by sub-server ID. A member must have at
+# least one listed role in the main guild before they can remain in that
+# sub-server. Sub-servers without an entry only require main-guild membership.
+required_role_ids:
+  1545162007354024040:
+    - 1301694741083328565 # Sharing
+
+# These sub-server roles bypass kicks for unmet membership/required-role checks.
+# Main-server ban enforcement still applies.
+exempt_role_ids:
+  1545162007354024040:
+    - 1545393232442163310
+
+# Structural mirroring can be limited to a subset of access-controlled
+# sub-servers. The new message-achievement server is intentionally access-only.
+mirrored_sub_guild_ids:
+  - 1545132788997427260
 
 # Everything in this section is applied one-way: main guild -> sub-server.
 mirror:

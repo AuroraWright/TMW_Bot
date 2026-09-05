@@ -21,6 +21,7 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.main_guild = Mock(id=MAIN_GUILD_ID)
         self.sub_guild = Mock(id=SUB_GUILD_ID, members=[])
+        self.sub_guild.get_member.return_value = None
         self.sub_guild.kick = AsyncMock()
         self.sub_guild.ban = AsyncMock()
         self.sub_guild.unban = AsyncMock()
@@ -65,6 +66,79 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
             AccessStatus.ELIGIBLE,
         )
 
+    async def test_sub_server_can_require_a_main_guild_role(self):
+        required_role = make_role(10, 1)
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            required_role_ids_by_sub_guild={SUB_GUILD_ID: (required_role.id,)},
+        )
+        self.main_guild.get_member.return_value = self.make_main_member([])
+
+        self.assertEqual(
+            await self.cog._get_access_status(USER_ID, SUB_GUILD_ID),
+            AccessStatus.MISSING_REQUIRED_ROLE,
+        )
+
+        self.main_guild.get_member.return_value = self.make_main_member([required_role])
+        self.assertEqual(
+            await self.cog._get_access_status(USER_ID, SUB_GUILD_ID),
+            AccessStatus.ELIGIBLE,
+        )
+
+    async def test_missing_required_role_is_kicked(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            required_role_ids_by_sub_guild={SUB_GUILD_ID: (10,)},
+        )
+        self.cog._get_access_status = AsyncMock(
+            return_value=AccessStatus.MISSING_REQUIRED_ROLE
+        )
+
+        await self.cog.on_member_join(self.make_sub_member())
+
+        self.sub_guild.kick.assert_awaited_once()
+
+    async def test_exemption_role_bypasses_missing_required_role_kick(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            required_role_ids_by_sub_guild={SUB_GUILD_ID: (10,)},
+            exempt_role_ids_by_sub_guild={SUB_GUILD_ID: (20,)},
+        )
+        self.cog._get_access_status = AsyncMock(
+            return_value=AccessStatus.MISSING_REQUIRED_ROLE
+        )
+        member = SimpleNamespace(
+            id=USER_ID,
+            guild=self.sub_guild,
+            roles=[make_role(20, 1)],
+        )
+
+        await self.cog._enforce_sub_member(member)
+
+        self.sub_guild.kick.assert_not_awaited()
+
+    async def test_exemption_role_bypasses_not_in_main_kick(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            exempt_role_ids_by_sub_guild={SUB_GUILD_ID: (20,)},
+        )
+        self.cog._get_access_status = AsyncMock(
+            return_value=AccessStatus.NOT_IN_MAIN_GUILD
+        )
+        member = SimpleNamespace(
+            id=USER_ID,
+            guild=self.sub_guild,
+            roles=[make_role(20, 1)],
+        )
+
+        await self.cog._enforce_sub_member(member)
+
+        self.sub_guild.kick.assert_not_awaited()
+
     async def test_sub_server_join_without_main_membership_is_kicked(self):
         self.cog._get_access_status = AsyncMock(
             return_value=AccessStatus.NOT_IN_MAIN_GUILD
@@ -94,6 +168,22 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
         kicked_user = self.sub_guild.kick.await_args.args[0]
         self.assertEqual(kicked_user.id, USER_ID)
+
+    async def test_leaving_main_server_preserves_exempt_member(self):
+        self.cog.settings = SubServerSettings(
+            main_guild_id=MAIN_GUILD_ID,
+            sub_guild_ids=(SUB_GUILD_ID,),
+            exempt_role_ids_by_sub_guild={SUB_GUILD_ID: (20,)},
+        )
+        self.sub_guild.get_member.return_value = SimpleNamespace(
+            id=USER_ID,
+            guild=self.sub_guild,
+            roles=[make_role(20, 1)],
+        )
+
+        await self.cog.on_member_remove(self.make_main_member([]))
+
+        self.sub_guild.kick.assert_not_awaited()
 
     async def test_main_server_ban_is_propagated(self):
         user = SimpleNamespace(id=USER_ID)
@@ -201,6 +291,21 @@ class SubServerAccessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SubServerSettingsTests(unittest.TestCase):
+    def test_per_sub_server_requirements_and_exemptions_are_configurable(self):
+        settings = SubServerSettings.from_mapping(
+            {
+                "main_guild_id": 1,
+                "sub_guild_ids": [2, 3],
+                "required_role_ids": {"3": [10]},
+                "exempt_role_ids": {3: 20},
+                "mirrored_sub_guild_ids": [2],
+            }
+        )
+
+        self.assertEqual(settings.required_role_ids_for(3), (10,))
+        self.assertEqual(settings.exempt_role_ids_for(3), (20,))
+        self.assertEqual(settings.mirror_guild_ids, (2,))
+
     def test_duplicate_sub_server_ids_are_removed(self):
         settings = SubServerSettings.from_mapping(
             {

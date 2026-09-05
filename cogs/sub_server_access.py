@@ -46,10 +46,56 @@ FROM sub_server_mirrored_bans
 WHERE main_guild_id = ? AND sub_guild_id = ? AND user_id = ?;"""
 
 
+def _parse_sub_guild_role_ids(
+    configured_role_map: Any,
+    sub_guild_ids: tuple[int, ...],
+    setting_name: str,
+) -> dict[int, tuple[int, ...]]:
+    if configured_role_map is None:
+        return {}
+    if not isinstance(configured_role_map, dict):
+        raise TypeError(f"{setting_name} must be a mapping of guild IDs to role IDs.")
+
+    parsed: dict[int, tuple[int, ...]] = {}
+    for configured_guild_id, configured_role_ids in configured_role_map.items():
+        try:
+            guild_id = int(configured_guild_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{setting_name} must contain integer sub-server IDs."
+            ) from error
+        if guild_id not in sub_guild_ids:
+            raise ValueError(
+                f"{setting_name} contains unconfigured sub-server {guild_id}."
+            )
+
+        role_values = (
+            configured_role_ids
+            if isinstance(configured_role_ids, list)
+            else [configured_role_ids]
+        )
+        try:
+            role_ids = tuple(dict.fromkeys(int(role_id) for role_id in role_values))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"{setting_name} must contain integer Discord role IDs."
+            ) from error
+        if not role_ids:
+            raise ValueError(
+                f"{setting_name} for sub-server {guild_id} cannot be empty."
+            )
+        parsed[guild_id] = role_ids
+
+    return parsed
+
+
 @dataclass(frozen=True)
 class SubServerSettings:
     main_guild_id: int
     sub_guild_ids: tuple[int, ...]
+    required_role_ids_by_sub_guild: dict[int, tuple[int, ...]] | None = None
+    exempt_role_ids_by_sub_guild: dict[int, tuple[int, ...]] | None = None
+    mirrored_sub_guild_ids: tuple[int, ...] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any]) -> "SubServerSettings":
@@ -75,10 +121,63 @@ class SubServerSettings:
         if main_guild_id in sub_guild_ids:
             raise ValueError("The main guild cannot also be a sub-server.")
 
+        required_role_ids_by_sub_guild = _parse_sub_guild_role_ids(
+            data.get("required_role_ids"),
+            sub_guild_ids,
+            "required_role_ids",
+        )
+        exempt_role_ids_by_sub_guild = _parse_sub_guild_role_ids(
+            data.get("exempt_role_ids"),
+            sub_guild_ids,
+            "exempt_role_ids",
+        )
+
+        mirrored_ids_data = data.get("mirrored_sub_guild_ids")
+        if mirrored_ids_data is None:
+            mirrored_sub_guild_ids = None
+        else:
+            if not isinstance(mirrored_ids_data, list):
+                raise TypeError(
+                    "mirrored_sub_guild_ids must be a list of Discord guild IDs."
+                )
+            try:
+                mirrored_sub_guild_ids = tuple(
+                    dict.fromkeys(int(guild_id) for guild_id in mirrored_ids_data)
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "Every mirrored_sub_guild_ids entry must be an integer."
+                ) from error
+            unknown_mirrored_ids = set(mirrored_sub_guild_ids) - set(sub_guild_ids)
+            if unknown_mirrored_ids:
+                raise ValueError(
+                    "mirrored_sub_guild_ids must only contain configured sub-server IDs."
+                )
+
         return cls(
             main_guild_id=main_guild_id,
             sub_guild_ids=sub_guild_ids,
+            required_role_ids_by_sub_guild=required_role_ids_by_sub_guild,
+            exempt_role_ids_by_sub_guild=exempt_role_ids_by_sub_guild,
+            mirrored_sub_guild_ids=mirrored_sub_guild_ids,
         )
+
+    @property
+    def mirror_guild_ids(self) -> tuple[int, ...]:
+        """Return destinations that receive the structural mirror.
+
+        Older configurations did not distinguish access-only destinations, so
+        omitting ``mirrored_sub_guild_ids`` preserves the previous behavior.
+        """
+        if self.mirrored_sub_guild_ids is None:
+            return self.sub_guild_ids
+        return self.mirrored_sub_guild_ids
+
+    def required_role_ids_for(self, sub_guild_id: int) -> tuple[int, ...]:
+        return (self.required_role_ids_by_sub_guild or {}).get(sub_guild_id, ())
+
+    def exempt_role_ids_for(self, sub_guild_id: int) -> tuple[int, ...]:
+        return (self.exempt_role_ids_by_sub_guild or {}).get(sub_guild_id, ())
 
 
 def load_sub_server_settings(path: Path) -> SubServerSettings:
@@ -97,6 +196,7 @@ class AccessStatus(Enum):
     ELIGIBLE = "eligible"
     NOT_IN_MAIN_GUILD = "not_in_main_guild"
     BANNED_FROM_MAIN_GUILD = "banned_from_main_guild"
+    MISSING_REQUIRED_ROLE = "missing_required_role"
     CANNOT_VERIFY = "cannot_verify"
 
 
@@ -127,7 +227,15 @@ class SubServerAccess(commands.Cog):
     def _is_bot_user(self, user_id: int) -> bool:
         return self.bot.user is not None and user_id == self.bot.user.id
 
-    async def _get_access_status(self, user_id: int) -> AccessStatus:
+    def _has_access_exemption(self, member: discord.Member) -> bool:
+        exempt_role_ids = self.settings.exempt_role_ids_for(member.guild.id)
+        return any(role.id in exempt_role_ids for role in getattr(member, "roles", ()))
+
+    async def _get_access_status(
+        self,
+        user_id: int,
+        sub_guild_id: int | None = None,
+    ) -> AccessStatus:
         main_guild = self._get_main_guild()
         if main_guild is None:
             _log.error(
@@ -150,6 +258,12 @@ class SubServerAccess(commands.Cog):
                     error,
                 )
                 return AccessStatus.CANNOT_VERIFY
+
+        required_role_ids = self.settings.required_role_ids_for(sub_guild_id or 0)
+        if required_role_ids and not any(
+            role.id in required_role_ids for role in main_member.roles
+        ):
+            return AccessStatus.MISSING_REQUIRED_ROLE
 
         return AccessStatus.ELIGIBLE
 
@@ -280,8 +394,18 @@ class SubServerAccess(commands.Cog):
         if self._is_bot_user(member.id):
             return
 
-        access_status = await self._get_access_status(member.id)
+        access_status = await self._get_access_status(member.id, member.guild.id)
         if access_status is AccessStatus.ELIGIBLE:
+            return
+        if access_status in {
+            AccessStatus.NOT_IN_MAIN_GUILD,
+            AccessStatus.MISSING_REQUIRED_ROLE,
+        } and self._has_access_exemption(member):
+            _log.info(
+                "Allowing member %s to remain in sub-server %s because of an access exemption role.",
+                member.id,
+                member.guild.id,
+            )
             return
         if access_status is AccessStatus.CANNOT_VERIFY:
             _log.warning(
@@ -300,6 +424,9 @@ class SubServerAccess(commands.Cog):
 
         reasons = {
             AccessStatus.NOT_IN_MAIN_GUILD: "User is not in the main server.",
+            AccessStatus.MISSING_REQUIRED_ROLE: (
+                "User does not have the required main-server role."
+            ),
         }
         await self._kick_from_sub_guild(
             member.guild,
@@ -424,6 +551,21 @@ class SubServerAccess(commands.Cog):
             return
 
         for sub_guild in self._get_sub_guilds():
+            get_destination_member = getattr(sub_guild, "get_member", None)
+            destination_member = (
+                get_destination_member(member.id)
+                if callable(get_destination_member)
+                else None
+            )
+            if destination_member is not None and self._has_access_exemption(
+                destination_member
+            ):
+                _log.info(
+                    "Allowing member %s to remain in sub-server %s because of an access exemption role.",
+                    member.id,
+                    sub_guild.id,
+                )
+                continue
             await self._kick_from_sub_guild(
                 sub_guild,
                 member.id,
@@ -467,6 +609,22 @@ class SubServerAccess(commands.Cog):
                     user.id,
                     "User was unbanned from the main server.",
                 )
+
+    @commands.Cog.listener()
+    async def on_member_update(
+        self,
+        before: discord.Member,
+        after: discord.Member,
+    ) -> None:
+        if after.guild.id != self.settings.main_guild_id:
+            return
+        if before.roles == after.roles:
+            return
+
+        for sub_guild in self._get_sub_guilds():
+            destination_member = sub_guild.get_member(after.id)
+            if destination_member is not None:
+                await self._enforce_sub_member(destination_member)
 
 
 async def setup(bot: TMWBot) -> None:

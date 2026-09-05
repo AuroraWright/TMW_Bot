@@ -1,0 +1,20 @@
+# Message-count role rules. Each rule counts human-authored messages in the
+# source guild and grants its destination role only in the destination guild.
+enabled: true
+retroactive_scan: true
+monitor_new_messages: true
+reconcile_interval_minutes: 30
+history_batch_size: 100
+history_batch_delay_seconds: 0.25
+
+rules:
+  - name: main_guild_50_messages
+    source_guild_id: 617136488840429598
+    destination_guild_id: 1545162007354024040
+    destination_role_id: 1545600348033384469
+    message_threshold: 50
+    # Excludes these channels and every thread whose parent is one of them.
+    excluded_channel_ids:
+      - 1027706916874506311
+      - 1345775806399647907
+      - 814947177608118273

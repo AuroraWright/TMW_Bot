@@ -165,13 +165,13 @@ class SubServerMirror(commands.Cog):
     def _get_sub_guilds(self) -> list[discord.Guild]:
         return [
             guild
-            for guild_id in self.access_settings.sub_guild_ids
+            for guild_id in self.access_settings.mirror_guild_ids
             if (guild := self.bot.get_guild(guild_id)) is not None
         ]
 
     def _is_mirrored_guild_id(self, guild_id: int) -> bool:
         return guild_id == self.access_settings.main_guild_id or (
-            guild_id in self.access_settings.sub_guild_ids
+            guild_id in self.access_settings.mirror_guild_ids
         )
 
     def _validate_direction(
@@ -181,7 +181,7 @@ class SubServerMirror(commands.Cog):
     ) -> None:
         if source_guild.id != self.access_settings.main_guild_id:
             raise RuntimeError("Mirror source is not the configured main guild.")
-        if destination_guild.id not in self.access_settings.sub_guild_ids:
+        if destination_guild.id not in self.access_settings.mirror_guild_ids:
             raise RuntimeError("Mirror destination is not a configured sub-server.")
         if source_guild.id == destination_guild.id:
             raise RuntimeError("The mirror source and destination must differ.")
@@ -1934,7 +1934,7 @@ class SubServerMirror(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        if member.guild.id in self.access_settings.sub_guild_ids:
+        if member.guild.id in self.access_settings.mirror_guild_ids:
             self._schedule_member_sync(member)
 
     @commands.Cog.listener()
@@ -1948,7 +1948,7 @@ class SubServerMirror(commands.Cog):
                 destination_member = sub_guild.get_member(after.id)
                 if destination_member is not None:
                     self._schedule_member_sync(destination_member)
-        elif after.guild.id in self.access_settings.sub_guild_ids:
+        elif after.guild.id in self.access_settings.mirror_guild_ids:
             self._schedule_member_sync(after)
 
 
