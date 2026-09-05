@@ -57,6 +57,7 @@ class MessageCountRoleSettingsTests(unittest.TestCase):
         self.assertEqual(rule["destination_role_id"], 1545600348033384469)
         self.assertEqual(rule["message_threshold"], 10)
         self.assertEqual(config["auto_receive_interval_minutes"], 15)
+        self.assertEqual(config["history_scan_worker_count"], 2)
         self.assertEqual(config["award_worker_count"], 2)
         self.assertEqual(
             rule["excluded_channel_ids"],
@@ -249,6 +250,56 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([channel.id for channel in channels], [40])
 
+    async def test_all_private_archived_threads_are_discovered_with_manage_threads(self):
+        calls = []
+        public_thread = make_history_channel(
+            51,
+            [],
+            parent_id=50,
+            channel_type=11,
+        )
+        private_thread = make_history_channel(
+            52,
+            [],
+            parent_id=50,
+            channel_type=12,
+        )
+
+        async def archived_threads(**kwargs):
+            calls.append(kwargs)
+            if kwargs == {"private": False, "limit": None}:
+                yield public_thread
+            elif kwargs == {
+                "private": True,
+                "joined": False,
+                "limit": None,
+            }:
+                yield private_thread
+            else:
+                self.fail(f"Unexpected archived-thread request: {kwargs}")
+
+        parent = SimpleNamespace(
+            id=50,
+            type=SimpleNamespace(value=0),
+            archived_threads=archived_threads,
+            permissions_for=Mock(
+                return_value=SimpleNamespace(manage_threads=True)
+            ),
+        )
+        self.source_guild.channels = [parent]
+        self.source_guild.me = SimpleNamespace(id=999)
+
+        channels = await self.cog._message_channels(self.rule, self.source_guild)
+
+        self.assertEqual([channel.id for channel in channels], [51, 52])
+        self.assertEqual(
+            calls,
+            [
+                {"private": False, "limit": None},
+                {"private": True, "joined": False, "limit": None},
+            ],
+        )
+
     async def test_scan_resumes_after_saved_cursor(self):
         history_calls = []
         messages = [make_message(3, SimpleNamespace(id=10, parent_id=None))]
@@ -266,12 +317,81 @@ class MessageCountRolesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(history_calls[0]["after"].id, 2)
         self.assertEqual(self.cog._scan_cursors[self.rule.name][channel.id], 3)
 
+    async def test_channel_scans_are_bounded_by_scan_worker_count(self):
+        settings = MessageCountRoleSettings(
+            enabled=True,
+            retroactive_scan=True,
+            monitor_new_messages=True,
+            reconcile_interval_minutes=30,
+            history_scan_worker_count=2,
+            rules=(self.rule,),
+        )
+        cog = MessageCountRoles(self.bot, settings)
+        active = 0
+        maximum_active = 0
+        scanned_ids = []
+
+        async def scan_channel(_rule, channel):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            scanned_ids.append(channel.id)
+            await asyncio.sleep(0)
+            active -= 1
+
+        cog._scan_channel = scan_channel
+        channels = [SimpleNamespace(id=index) for index in range(5)]
+
+        await cog._scan_channels(self.rule, channels)
+
+        self.assertEqual(sorted(scanned_ids), list(range(5)))
+        self.assertLessEqual(maximum_active, 2)
+
     async def test_destination_member_join_uses_loaded_count(self):
         self.cog._counts[self.rule.name][USER_ID] = self.rule.message_threshold
 
         await self.cog.on_member_join(self.destination_member)
 
         self.destination_member.add_roles.assert_awaited_once()
+
+    async def test_history_threshold_queues_without_waiting_for_role_api(self):
+        settings = MessageCountRoleSettings(
+            enabled=True,
+            retroactive_scan=True,
+            monitor_new_messages=True,
+            reconcile_interval_minutes=30,
+            award_worker_count=1,
+            rules=(self.rule,),
+        )
+        cog = MessageCountRoles(self.bot, settings)
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def award_member(_rule, _member):
+            started.set()
+            await release.wait()
+            return True
+
+        cog._award_member = award_member
+        cog._start_award_workers()
+        channel = SimpleNamespace(id=10, parent_id=None)
+
+        await cog._record_message(
+            self.rule,
+            make_message(1, channel),
+            from_history=True,
+        )
+        await cog._record_message(
+            self.rule,
+            make_message(2, channel),
+            from_history=True,
+        )
+
+        await started.wait()
+        self.assertFalse(release.is_set())
+        release.set()
+        await cog._award_queue.join()
+        await cog._stop_award_workers()
 
     async def test_destination_member_join_refreshes_persisted_count(self):
         self.bot.GET.return_value = [(self.rule.message_threshold,)]

@@ -33,9 +33,12 @@ destination members that are absent from the local cache. Excluded channel IDs
 also exclude their child threads. A user must be present in the destination
 guild to receive the role. Role awards are deduplicated through a bounded
 priority queue: live joins and threshold crossings are handled before
-lower-priority historical backfill. The worker count is configurable with
-`award_worker_count` in `config/message_count_roles.yml` (keep it conservative
-to avoid Discord rate limits).
+lower-priority historical backfill. Independent channel and thread histories
+are scanned with a separate bounded worker pool, and historical threshold
+crossings are submitted to the backfill queue immediately. The worker counts
+are configurable with `history_scan_worker_count` and `award_worker_count` in
+`config/message_count_roles.yml` (keep them conservative to avoid Discord rate
+limits).
 
 ---
 

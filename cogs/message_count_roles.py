@@ -154,6 +154,7 @@ class MessageCountRoleSettings:
     auto_receive_interval_minutes: float = 15.0
     history_batch_size: int = 100
     history_batch_delay_seconds: float = 0.25
+    history_scan_worker_count: int = 2
     award_worker_count: int = 2
     rules: tuple[MessageCountRoleRule, ...] = ()
 
@@ -220,6 +221,13 @@ class MessageCountRoleSettings:
             "history_batch_size",
             minimum=1,
         )
+        history_scan_worker_count = _integer(
+            data.get("history_scan_worker_count", cls().history_scan_worker_count),
+            "history_scan_worker_count",
+            minimum=1,
+        )
+        if history_scan_worker_count > 4:
+            raise ValueError("history_scan_worker_count cannot be greater than 4.")
         award_worker_count = _integer(
             data.get("award_worker_count", cls().award_worker_count),
             "award_worker_count",
@@ -257,6 +265,7 @@ class MessageCountRoleSettings:
             auto_receive_interval_minutes=auto_receive_interval_minutes,
             history_batch_size=history_batch_size,
             history_batch_delay_seconds=history_batch_delay_seconds,
+            history_scan_worker_count=history_scan_worker_count,
             award_worker_count=award_worker_count,
             rules=rules,
         )
@@ -380,6 +389,22 @@ class MessageCountRoles(commands.Cog):
             cls._is_thread_channel(channel) and parent_id in excluded_channel_ids
         )
 
+    @staticmethod
+    def _can_manage_threads(
+        source_guild: discord.Guild,
+        channel: Any,
+    ) -> bool | None:
+        """Return the bot's channel-level Manage Threads permission when known."""
+        me = getattr(source_guild, "me", None)
+        permissions_for = getattr(channel, "permissions_for", None)
+        if me is None or not callable(permissions_for):
+            return None
+        try:
+            permissions = permissions_for(me)
+        except Exception:  # noqa: BLE001 - permission lookup is best effort
+            return None
+        return bool(getattr(permissions, "manage_threads", False))
+
     async def _message_channels(
         self,
         rule: MessageCountRoleRule,
@@ -462,13 +487,23 @@ class MessageCountRoles(commands.Cog):
             archived_threads = getattr(parent, "archived_threads", None)
             if not callable(archived_threads):
                 continue
-            archive_modes = (False,) if self._is_forum_parent(parent) else (False, True)
-            for private in archive_modes:
-                kwargs: dict[str, Any] = {"private": private, "limit": None}
-                if private:
-                    kwargs["joined"] = True
-                if self._is_forum_parent(parent):
-                    kwargs = {"limit": None}
+            if self._is_forum_parent(parent):
+                archive_requests = ({"limit": None},)
+            else:
+                can_manage_threads = self._can_manage_threads(source_guild, parent)
+                # A bot with Manage Threads can enumerate every private
+                # archived thread.  Without it, Discord only permits the
+                # joined-private endpoint.  If the permission cache is
+                # unavailable, try the complete endpoint and fall back on 403.
+                archive_requests = (
+                    {"private": False, "limit": None},
+                    {
+                        "private": True,
+                        "joined": can_manage_threads is False,
+                        "limit": None,
+                    },
+                )
+            for kwargs in archive_requests:
                 try:
                     async for thread in archived_threads(**kwargs):
                         add_channel(thread)
@@ -479,10 +514,40 @@ class MessageCountRoles(commands.Cog):
                         source_guild.id,
                         error,
                     )
-                except (discord.Forbidden, discord.HTTPException) as error:
+                except discord.Forbidden as error:
+                    if kwargs.get("private") and not kwargs.get("joined"):
+                        _log.warning(
+                            "Could not enumerate all private archived threads for channel %s in guild %s; retrying joined private threads only: %s",
+                            getattr(parent, "id", "unknown"),
+                            source_guild.id,
+                            error,
+                        )
+                        try:
+                            async for thread in archived_threads(
+                                private=True,
+                                joined=True,
+                                limit=None,
+                            ):
+                                add_channel(thread)
+                        except (TypeError, discord.Forbidden, discord.HTTPException) as fallback_error:
+                            _log.warning(
+                                "Could not enumerate joined private archived threads for channel %s in guild %s: %s",
+                                getattr(parent, "id", "unknown"),
+                                source_guild.id,
+                                fallback_error,
+                            )
+                        continue
                     _log.warning(
                         "Could not enumerate %s archived threads for channel %s in guild %s: %s",
-                        "private" if private else "public",
+                        "private" if kwargs.get("private") else "public",
+                        getattr(parent, "id", "unknown"),
+                        source_guild.id,
+                        error,
+                    )
+                except discord.HTTPException as error:
+                    _log.warning(
+                        "Could not enumerate %s archived threads for channel %s in guild %s: %s",
+                        "private" if kwargs.get("private") else "public",
                         getattr(parent, "id", "unknown"),
                         source_guild.id,
                         error,
@@ -542,15 +607,18 @@ class MessageCountRoles(commands.Cog):
             self._messages_since_flush += 1
             crossed_threshold = new_count == rule.message_threshold
 
-        # Historical scans only update durable counters here.  Awarding from
-        # this hot loop would serialize the scan on a destination API request;
-        # the resumable backfill phase queues all qualifying members afterward.
-        if crossed_threshold and not from_history:
+        if crossed_threshold:
             await self._award_cached_member(
                 rule,
                 user_id,
-                priority=self._AWARD_PRIORITY_LIVE,
-                source="live-threshold",
+                priority=(
+                    self._AWARD_PRIORITY_BACKFILL
+                    if from_history
+                    else self._AWARD_PRIORITY_LIVE
+                ),
+                source="history-threshold" if from_history else "live-threshold",
+                wait=not from_history,
+                fetch_if_missing=not from_history,
             )
         return True
 
@@ -742,28 +810,17 @@ class MessageCountRoles(commands.Cog):
             finally:
                 self._award_queue.task_done()
 
-    async def _queue_award(
+    def _enqueue_award_request(
         self,
         rule: MessageCountRoleRule,
         member: discord.Member,
         *,
         priority: int,
         source: str,
-    ) -> bool:
-        """Queue a role award, or process it inline before workers are ready."""
+    ) -> asyncio.Future[bool] | None:
+        """Submit an award and return its shared future when workers are active."""
         if not self._award_workers_are_running():
-            async with self._inline_award_lock:
-                started_at = time.monotonic()
-                result = await self._award_member(rule, member)
-                _log.info(
-                    "Completed inline message-count role award for member %s in rule %s (source=%s, request_time=%.2fs, result=%s).",
-                    member.id,
-                    rule.name,
-                    source,
-                    max(0.0, time.monotonic() - started_at),
-                    result,
-                )
-                return result
+            return None
 
         key = (rule.name, member.id)
         existing = self._pending_awards.get(key)
@@ -782,7 +839,7 @@ class MessageCountRoles(commands.Cog):
                         existing,
                     )
                 )
-            return await asyncio.shield(existing.future)
+            return existing.future
 
         loop = asyncio.get_running_loop()
         request = _AwardRequest(
@@ -801,7 +858,38 @@ class MessageCountRoles(commands.Cog):
         self._award_queue.put_nowait(
             (request.priority, request.sequence, request.generation, request)
         )
-        return await asyncio.shield(request.future)
+        return request.future
+
+    async def _queue_award(
+        self,
+        rule: MessageCountRoleRule,
+        member: discord.Member,
+        *,
+        priority: int,
+        source: str,
+    ) -> bool:
+        """Queue a role award, or process it inline before workers are ready."""
+        future = self._enqueue_award_request(
+            rule,
+            member,
+            priority=priority,
+            source=source,
+        )
+        if future is not None:
+            return await asyncio.shield(future)
+
+        async with self._inline_award_lock:
+            started_at = time.monotonic()
+            result = await self._award_member(rule, member)
+            _log.info(
+                "Completed inline message-count role award for member %s in rule %s (source=%s, request_time=%.2fs, result=%s).",
+                member.id,
+                rule.name,
+                source,
+                max(0.0, time.monotonic() - started_at),
+                result,
+            )
+            return result
 
     async def _award_member_safely(
         self,
@@ -830,6 +918,8 @@ class MessageCountRoles(commands.Cog):
         *,
         priority: int = _AWARD_PRIORITY_LIVE,
         source: str = "threshold",
+        wait: bool = True,
+        fetch_if_missing: bool = True,
     ) -> None:
         destination_guild = self._get_destination_guild(rule)
         if destination_guild is None:
@@ -838,6 +928,8 @@ class MessageCountRoles(commands.Cog):
         if member is None:
             member = self._destination_member_cache.get((destination_guild.id, user_id))
         if member is None:
+            if not fetch_if_missing:
+                return
             fetch_member = getattr(destination_guild, "fetch_member", None)
             if callable(fetch_member):
                 try:
@@ -858,6 +950,14 @@ class MessageCountRoles(commands.Cog):
                     return
         if member is not None:
             self._destination_member_cache[(destination_guild.id, member.id)] = member
+            if not wait and self._award_workers_are_running():
+                self._enqueue_award_request(
+                    rule,
+                    member,
+                    priority=priority,
+                    source=source,
+                )
+                return
             await self._award_member_safely(
                 rule,
                 member,
@@ -1089,6 +1189,53 @@ class MessageCountRoles(commands.Cog):
             if latest_message_id != cursor:
                 await self._save_scan_cursor(rule, channel_id, latest_message_id)
 
+    async def _scan_channels(
+        self,
+        rule: MessageCountRoleRule,
+        channels: list[Any],
+    ) -> None:
+        """Scan distinct channels concurrently with a bounded worker pool."""
+        if not channels:
+            return
+
+        channel_queue: asyncio.Queue[Any] = asyncio.Queue()
+        for channel in channels:
+            channel_queue.put_nowait(channel)
+
+        async def worker(worker_index: int) -> None:
+            while True:
+                channel = await channel_queue.get()
+                try:
+                    await self._scan_channel(rule, channel)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - keep other channels scanning
+                    _log.exception(
+                        "Unexpected failure while scanning channel %s for message-count role rule %s (worker=%s).",
+                        getattr(channel, "id", "unknown"),
+                        rule.name,
+                        worker_index,
+                    )
+                finally:
+                    channel_queue.task_done()
+
+        workers = [
+            asyncio.create_task(
+                worker(index),
+                name=f"message-count-role-scan-{rule.name}-{index}",
+            )
+            for index in range(
+                min(self.settings.history_scan_worker_count, len(channels))
+            )
+        ]
+        try:
+            await channel_queue.join()
+        finally:
+            for worker_task in workers:
+                worker_task.cancel()
+            if workers:
+                await asyncio.gather(*workers, return_exceptions=True)
+
     async def _reconcile_rule(self, rule: MessageCountRoleRule) -> None:
         source_guild = self.bot.get_guild(rule.source_guild_id)
         destination_guild = self._get_destination_guild(rule)
@@ -1105,12 +1252,12 @@ class MessageCountRoles(commands.Cog):
         if self.settings.retroactive_scan:
             channels = await self._message_channels(rule, source_guild)
             _log.info(
-                "Scanning %s message channels for message-count role rule %s.",
+                "Scanning %s message channels for message-count role rule %s with %s workers.",
                 len(channels),
                 rule.name,
+                min(self.settings.history_scan_worker_count, len(channels)),
             )
-            for channel in channels:
-                await self._scan_channel(rule, channel)
+            await self._scan_channels(rule, channels)
             await self._flush_dirty_counts()
 
         await self._award_qualified_members(rule, destination_guild)
