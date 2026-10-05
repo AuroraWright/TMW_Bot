@@ -167,20 +167,32 @@ class Selfmute(commands.Cog):
             mute_data = await self.bot.GET(GET_ALL_USER_MUTES_QUERY, (interaction.user.id,))
         else:
             mute_data = await self.bot.GET(GET_USER_MUTE_QUERY, (interaction.guild.id, interaction.user.id))
-        if not mute_data and interaction.guild:
-            await self.perform_user_unmute(interaction.user, interaction.channel, mute_data)
+        if not mute_data:
+            if interaction.guild:
+                await self.perform_user_unmute(interaction.user, interaction.channel, None)
             await interaction.followup.send("You are not muted.", ephemeral=True)
             return
         for mute_data_guild in mute_data:
             guild_id, user_id, mute_role_id, role_ids_to_restore, unmute_time = mute_data_guild
             mute_guild = self.bot.get_guild(guild_id)
+            if mute_guild is None:
+                await interaction.followup.send("I cannot access a server with a saved mute for you.", ephemeral=True)
+                continue
             unmute_time = datetime.strptime(unmute_time, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             if unmute_time > discord.utils.utcnow():
                 await interaction.followup.send(f"You are muted until <t:{int(unmute_time.timestamp())}:F>" + f"which is <t:{int(unmute_time.timestamp())}:R> on `{mute_guild.name}`.", ephemeral=True)
             else:
                 announce_channel_id = selfmute_settings.get(guild_id, {}).get("announce_channel")
                 announce_channel = mute_guild.get_channel(announce_channel_id)
-                await self.perform_user_unmute(interaction.user, announce_channel, mute_data)
+                member = mute_guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await mute_guild.fetch_member(user_id)
+                    except discord.NotFound:
+                        await self.bot.RUN(REMOVE_MUTE_QUERY, (guild_id, user_id))
+                        await interaction.followup.send(f"You are no longer in `{mute_guild.name}`. Your expired mute record has been removed.", ephemeral=True)
+                        continue
+                await self.perform_user_unmute(member, announce_channel, mute_data_guild)
                 await interaction.followup.send("You are not muted anymore.", ephemeral=True)
 
     @tasks.loop(minutes=1)

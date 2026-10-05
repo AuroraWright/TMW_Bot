@@ -32,6 +32,19 @@ class BotConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 expected_extensions = len(list(Path("cogs").glob("*.py")))
                 self.assertEqual(len(bot.extensions), expected_extensions)
 
+                for name in (
+                    "info",
+                    "log",
+                    "logs",
+                    "log_stats",
+                    "log_set_goal",
+                    "writing_club_log",
+                    "check_mute",
+                ):
+                    command = bot.tree.get_command(name)
+                    self.assertIsNotNone(command, name)
+                    self.assertTrue(command.to_dict(bot.tree)["dm_permission"], name)
+
                 await bot.on_ready()
                 self.assertEqual(ready_file.read_text(encoding="ascii"), "ready\n")
             finally:
