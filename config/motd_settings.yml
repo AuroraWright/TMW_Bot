@@ -1,0 +1,9 @@
+# Each configured guild posts at 00:00 UTC; loading the cog does not post immediately.
+617136488840429598:
+  channel_id: 1438971316014415963
+  message: |-
+    Heyho, アリス here!
+    - To get started learning Japanese, please check out the [guide](https://learnjapanese.moe/guide).
+    - To get access to the rest of the server, pass [the Student quiz](https://discord.com/channels/617136488840429598/1027706916874506311/1341506548777746453). See [this](https://discord.com/channels/617136488840429598/1438971316014415963/1466584207101788304) if you are struggling.
+    - When asking for advice here, please don't forget to include what your goals are learning Japanese, or else it will be difficult to help you.
+    - Don't forget to read more! (and listen.)
