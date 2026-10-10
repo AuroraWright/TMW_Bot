@@ -13,6 +13,7 @@ from lib.bot import TMWBot
 _log = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 GIF_HOSTS = ("tenor.com", "giphy.com", "klipy.com")
+DEFAULT_MAX_MESSAGE_AGE_SECONDS = 300
 SETTINGS_PATH = (
     os.getenv("ALT_GIF_FILTER_SETTINGS_PATH") or "config/gif_filter_settings.yml"
 )
@@ -72,6 +73,16 @@ class GifFilter(commands.Cog):
                 or config["mod_log_channel_id"] <= 0
                 or not isinstance(config.get("dm_message"), str)
                 or not 1 <= len(config["dm_message"].strip()) <= 1900
+                or type(
+                    config.get(
+                        "max_message_age_seconds", DEFAULT_MAX_MESSAGE_AGE_SECONDS
+                    )
+                )
+                is not int
+                or config.get(
+                    "max_message_age_seconds", DEFAULT_MAX_MESSAGE_AGE_SECONDS
+                )
+                <= 0
             ):
                 raise ValueError("Invalid GIF filter guild configuration.")
 
@@ -79,15 +90,30 @@ class GifFilter(commands.Cog):
         config = self.settings.get(guild_id)
         return config is not None and channel_id in config["channel_ids"]
 
+    def is_recent(self, guild_id: int, message_id: int) -> bool:
+        # The snowflake encodes the original post time; editing cannot reset it.
+        age = (
+            discord.utils.utcnow() - discord.utils.snowflake_time(message_id)
+        ).total_seconds()
+        limit = self.settings[guild_id].get(
+            "max_message_age_seconds", DEFAULT_MAX_MESSAGE_AGE_SECONDS
+        )
+        return 0 <= age <= limit
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         await self.moderate(message)
 
     @commands.Cog.listener()
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
-        if not self.watches(payload.guild_id, payload.channel_id):
+        if (
+            not self.watches(payload.guild_id, payload.channel_id)
+            or not self.is_recent(payload.guild_id, payload.message_id)
+            or not payload.data.get("edited_timestamp")
+        ):
             return
-        # Ignore embed-only updates and edits that contain no GIF indicators.
+        # Metadata/preview updates may echo existing content and attachments.
+        # Require an actual edit timestamp as well as GIF indicators.
         if not contains_gif(
             payload.data.get("content"), payload.data.get("attachments", [])
         ):
@@ -106,13 +132,14 @@ class GifFilter(commands.Cog):
                 payload.channel_id,
             )
             return
-        await self.moderate(message)
+        await self.moderate(message, source="edit")
 
-    async def moderate(self, message: discord.Message):
+    async def moderate(self, message: discord.Message, *, source="message"):
         if (
             message.guild is None
             or message.author.bot
             or not self.watches(message.guild.id, message.channel.id)
+            or not self.is_recent(message.guild.id, message.id)
             or not contains_gif(message.content, message.attachments)
             or message.id in self._inflight
             or message.id in self._deleted
@@ -134,6 +161,14 @@ class GifFilter(commands.Cog):
             self._deleted[message.id] = None
             if len(self._deleted) > 1024:
                 self._deleted.popitem(last=False)
+            _log.info(
+                "Deleted GIF message %s in guild %s channel %s (source=%s, posted_at=%s).",
+                message.id,
+                message.guild.id,
+                message.channel.id,
+                source,
+                discord.utils.snowflake_time(message.id).isoformat(),
+            )
 
             config = self.settings[message.guild.id]
             # Report independently of DM delivery, and never copy the GIF/content.
@@ -165,6 +200,9 @@ class GifFilter(commands.Cog):
             dm_message = config["dm_message"]
             if reported:
                 dm_message += " This incident has been reported to the moderators."
+            # A rate-limited log send must not cause an out-of-date warning DM.
+            if not self.is_recent(message.guild.id, message.id):
+                return
             try:
                 await message.author.send(
                     dm_message, allowed_mentions=discord.AllowedMentions.none()

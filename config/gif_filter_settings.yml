@@ -3,6 +3,8 @@
     - 617136489482027059
     - 1184213422699724861
   mod_log_channel_id: 1010323632750350437
+  # Age of the original post; edits never make an old message eligible again.
+  max_message_age_seconds: 300
   dm_message: >-
     Posting GIFs is not permitted in the general channels.
     (See Rule 5).

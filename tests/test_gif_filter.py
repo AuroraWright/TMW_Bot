@@ -1,7 +1,8 @@
 import asyncio
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import discord
 
@@ -66,11 +67,16 @@ class GifDetectionTests(unittest.TestCase):
 
 class GifFilterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.now = datetime(2026, 10, 10, 12, tzinfo=timezone.utc)
+        clock = patch("cogs.gif_filter.discord.utils.utcnow", return_value=self.now)
+        clock.start()
+        self.addCleanup(clock.stop)
         self.settings = {
             1: {
                 "channel_ids": [10],
                 "mod_log_channel_id": 20,
                 "dm_message": "No GIFs. (See Rule 5).",
+                "max_message_age_seconds": 300,
             }
         }
         self.guild = SimpleNamespace(id=1)
@@ -86,7 +92,7 @@ class GifFilterTests(unittest.IsolatedAsyncioTestCase):
         )
         self.cog = GifFilter(self.bot, self.settings)
         self.message = SimpleNamespace(
-            id=100,
+            id=discord.utils.time_snowflake(self.now),
             guild=self.guild,
             channel=self.channel,
             author=SimpleNamespace(id=200, bot=False, send=AsyncMock()),
@@ -174,11 +180,14 @@ class GifFilterTests(unittest.IsolatedAsyncioTestCase):
         payload = SimpleNamespace(
             guild_id=1,
             channel_id=10,
-            message_id=100,
-            data={"content": self.message.content},
+            message_id=self.message.id,
+            data={
+                "content": self.message.content,
+                "edited_timestamp": self.now.isoformat(),
+            },
         )
         await self.cog.on_raw_message_edit(payload)
-        self.channel.fetch_message.assert_awaited_once_with(100)
+        self.channel.fetch_message.assert_awaited_once_with(self.message.id)
         self.message.delete.assert_awaited_once()
 
     async def test_embed_only_and_unwatched_edits_do_not_fetch(self):
@@ -189,7 +198,10 @@ class GifFilterTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.cog.on_raw_message_edit(
                 SimpleNamespace(
-                    guild_id=guild_id, channel_id=channel_id, message_id=100, data=data
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    message_id=self.message.id,
+                    data=data,
                 )
             )
         self.channel.fetch_message.assert_not_awaited()
@@ -198,8 +210,11 @@ class GifFilterTests(unittest.IsolatedAsyncioTestCase):
         payload = SimpleNamespace(
             guild_id=1,
             channel_id=10,
-            message_id=100,
-            data={"content": self.message.content},
+            message_id=self.message.id,
+            data={
+                "content": self.message.content,
+                "edited_timestamp": self.now.isoformat(),
+            },
         )
         self.message.content = "GIF has already been removed from this message"
         await self.cog.on_raw_message_edit(payload)
@@ -211,22 +226,165 @@ class GifFilterTests(unittest.IsolatedAsyncioTestCase):
             SimpleNamespace(
                 guild_id=1,
                 channel_id=10,
-                message_id=100,
-                data={"content": self.message.content},
+                message_id=self.message.id,
+                data={
+                    "content": self.message.content,
+                    "edited_timestamp": self.now.isoformat(),
+                },
             )
         )
         self.message.delete.assert_not_awaited()
 
     async def test_deleted_id_cache_is_bounded(self):
-        for index in range(1025):
+        for index in range(1023):
             self.cog._deleted[index] = None
+        self.cog._deleted[self.message.id] = None
         await self.cog.on_message(self.message)
         self.message.delete.assert_not_awaited()
         # A new deletion evicts the oldest retained IDs.
-        self.cog._deleted.pop(0)
-        self.message.id = 2000
+        self.message.id += 1
         await self.cog.on_message(self.message)
         self.assertEqual(len(self.cog._deleted), 1024)
+        self.assertNotIn(0, self.cog._deleted)
+
+    async def test_old_message_update_does_not_fetch_delete_log_or_dm(self):
+        self.message.id = discord.utils.time_snowflake(self.now - timedelta(days=30))
+        await self.cog.on_raw_message_edit(
+            SimpleNamespace(
+                guild_id=1,
+                channel_id=10,
+                message_id=self.message.id,
+                data={
+                    "content": self.message.content,
+                    "edited_timestamp": self.now.isoformat(),
+                },
+            )
+        )
+        self.channel.fetch_message.assert_not_awaited()
+        self.message.delete.assert_not_awaited()
+        self.log_channel.send.assert_not_awaited()
+        self.message.author.send.assert_not_awaited()
+
+    async def test_metadata_update_with_gif_content_does_not_fetch_or_delete(self):
+        for timestamp in (None, "missing"):
+            data = {
+                "content": self.message.content,
+                "attachments": [{"filename": "old.gif"}],
+                "embeds": [{}],
+            }
+            if timestamp is None:
+                data["edited_timestamp"] = None
+            await self.cog.on_raw_message_edit(
+                SimpleNamespace(
+                    guild_id=1,
+                    channel_id=10,
+                    message_id=self.message.id,
+                    data=data,
+                )
+            )
+        self.channel.fetch_message.assert_not_awaited()
+        self.message.delete.assert_not_awaited()
+        self.message.author.send.assert_not_awaited()
+
+    async def test_old_message_create_event_is_also_ignored(self):
+        self.message.id = discord.utils.time_snowflake(self.now - timedelta(days=30))
+        await self.cog.on_message(self.message)
+        self.message.delete.assert_not_awaited()
+        self.log_channel.send.assert_not_awaited()
+        self.message.author.send.assert_not_awaited()
+
+    async def test_recency_uses_original_post_time_and_configured_limit(self):
+        for age, expected in (
+            (0, True),
+            (299, True),
+            (300, True),
+            (301, False),
+            (-1, False),
+        ):
+            with self.subTest(age=age):
+                message_id = discord.utils.time_snowflake(
+                    self.now - timedelta(seconds=age)
+                )
+                self.assertEqual(self.cog.is_recent(1, message_id), expected)
+        self.settings[1]["max_message_age_seconds"] = 60
+        self.assertFalse(
+            self.cog.is_recent(
+                1, discord.utils.time_snowflake(self.now - timedelta(seconds=61))
+            )
+        )
+        del self.settings[1]["max_message_age_seconds"]
+        self.assertTrue(
+            self.cog.is_recent(
+                1, discord.utils.time_snowflake(self.now - timedelta(seconds=299))
+            )
+        )
+
+    async def test_message_age_is_rechecked_after_edit_fetch(self):
+        self.message.id = discord.utils.time_snowflake(
+            self.now - timedelta(seconds=299)
+        )
+
+        async def fetch(message_id):
+            self.now += timedelta(seconds=2)
+            return self.message
+
+        self.channel.fetch_message.side_effect = fetch
+        with patch(
+            "cogs.gif_filter.discord.utils.utcnow", side_effect=lambda: self.now
+        ):
+            await self.cog.on_raw_message_edit(
+                SimpleNamespace(
+                    guild_id=1,
+                    channel_id=10,
+                    message_id=self.message.id,
+                    data={
+                        "content": self.message.content,
+                        "edited_timestamp": self.now.isoformat(),
+                    },
+                )
+            )
+        self.channel.fetch_message.assert_awaited_once()
+        self.message.delete.assert_not_awaited()
+        self.message.author.send.assert_not_awaited()
+
+    async def test_slow_log_delivery_does_not_send_stale_dm(self):
+        async def report(*args, **kwargs):
+            self.now += timedelta(minutes=6)
+
+        self.log_channel.send.side_effect = report
+        with patch(
+            "cogs.gif_filter.discord.utils.utcnow", side_effect=lambda: self.now
+        ):
+            await self.cog.on_message(self.message)
+        self.message.delete.assert_awaited_once()
+        self.log_channel.send.assert_awaited_once()
+        self.message.author.send.assert_not_awaited()
+
+    async def test_dm_waits_for_successful_deletion(self):
+        deleting = asyncio.Event()
+        allow_delete = asyncio.Event()
+
+        async def delete():
+            deleting.set()
+            await allow_delete.wait()
+
+        self.message.delete.side_effect = delete
+        task = asyncio.create_task(self.cog.on_message(self.message))
+        try:
+            await deleting.wait()
+            self.message.author.send.assert_not_awaited()
+            self.log_channel.send.assert_not_awaited()
+        finally:
+            allow_delete.set()
+            await task
+        self.message.author.send.assert_awaited_once()
+
+    async def test_nonpositive_or_invalid_age_limits_are_rejected(self):
+        for limit in (0, -1, True, "300", 300.0):
+            with self.subTest(limit=limit):
+                self.settings[1]["max_message_age_seconds"] = limit
+                with self.assertRaises(ValueError):
+                    GifFilter(self.bot, self.settings)
 
     async def test_invalid_config_is_rejected(self):
         with self.assertRaises(TypeError):
